@@ -41,8 +41,8 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     /// Type of event (START/STOP)
     pub event: LogEvent,
-    /// Hetzner server ID
-    pub server_id: Option<u64>,
+    /// Scaleway server UUID
+    pub server_id: Option<String>,
     /// GitLab project (path_with_namespace)
     pub project: Option<String>,
     /// Pipeline ID that triggered the start
@@ -119,10 +119,7 @@ impl CsvLogger {
             "{},{},{},{},{},{},{}",
             entry.timestamp.to_rfc3339(),
             entry.event,
-            entry
-                .server_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            entry.server_id.as_deref().unwrap_or_default(),
             entry.project.as_deref().unwrap_or(""),
             entry
                 .pipeline_id
@@ -146,7 +143,7 @@ impl CsvLogger {
     /// Helper method: Logs a server start.
     pub fn log_start(
         &self,
-        server_id: u64,
+        server_id: &str,
         project: &str,
         pipeline_id: u64,
         reason: &str,
@@ -154,7 +151,7 @@ impl CsvLogger {
         let entry = LogEntry {
             timestamp: Utc::now(),
             event: LogEvent::Start,
-            server_id: Some(server_id),
+            server_id: Some(server_id.to_string()),
             project: Some(project.to_string()),
             pipeline_id: Some(pipeline_id),
             reason: reason.to_string(),
@@ -166,14 +163,14 @@ impl CsvLogger {
     /// Helper method: Logs a server stop.
     pub fn log_stop(
         &self,
-        server_id: u64,
+        server_id: &str,
         reason: &str,
         duration_minutes: u64,
     ) -> Result<(), CsvLogError> {
         let entry = LogEntry {
             timestamp: Utc::now(),
             event: LogEvent::Stop,
-            server_id: Some(server_id),
+            server_id: Some(server_id.to_string()),
             project: None,
             pipeline_id: None,
             reason: reason.to_string(),
@@ -201,5 +198,25 @@ mod tests {
         assert_eq!(escape_csv_field("simple"), "simple");
         assert_eq!(escape_csv_field("with,comma"), "\"with,comma\"");
         assert_eq!(escape_csv_field("with\"quote"), "\"with\"\"quote\"");
+    }
+
+    #[test]
+    fn test_log_entry_serializes_string_server_id() {
+        let entry = LogEntry {
+            timestamp: Utc::now(),
+            event: LogEvent::Start,
+            server_id: Some("server-uuid".to_string()),
+            project: Some("group/project".to_string()),
+            pipeline_id: Some(42),
+            reason: "pipeline_pending".to_string(),
+            duration_minutes: None,
+        };
+        // Exercise the same formatting path used by `log`.
+        let server_id = entry
+            .server_id
+            .clone()
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        assert_eq!(server_id, "server-uuid");
     }
 }

@@ -1,26 +1,23 @@
-//! GitLab Runner Orchestrator for Hetzner Cloud.
+//! GitLab Runner Orchestrator for Scaleway.
 //!
-//! Automatically creates Hetzner servers as GitLab runners when pipelines
-//! are pending and deletes them cost-optimized after completion.
+//! Automatically creates Scaleway servers as GitLab runners when pipelines
+//! are pending and terminates them once the minimum lifetime has elapsed.
 //!
 //! # How it works
 //!
 //! 1. Polls the GitLab API for active pipelines (pending/running)
-//! 2. On active pipeline: Create Hetzner server (if not present)
-//! 3. On no active pipelines: Delete server (after minimum runtime)
-//! 4. Deletion ideally 5min before next billing cycle
+//! 2. On active pipeline: Create Scaleway server (if not present)
+//! 3. On no active pipelines: Terminate server (after minimum runtime)
 //!
 //! # Configuration
 //!
-//! Expects `config/config.toml` with GitLab and Hetzner credentials.
+//! Expects `config/config.toml` with GitLab and Scaleway credentials.
 //! Expects `config/runner.toml` with GitLab Runner configuration.
 
 mod cloud_init;
 mod config;
 mod csv_log;
 mod gitlab;
-mod hetzner;
-#[allow(dead_code)] // wired in Task 2
 mod scaleway;
 mod state;
 
@@ -37,11 +34,8 @@ use crate::cloud_init::generate_cloud_init;
 use crate::config::{load_runner_config, Config};
 use crate::csv_log::CsvLogger;
 use crate::gitlab::GitLabClient;
-use crate::hetzner::HetznerClient;
+use crate::scaleway::{server_volume_ids, ScalewayClient};
 use crate::state::{OrchestratorState, RunnerState};
-
-/// Buffer in minutes before billing cycle for optimal deletion.
-const BILLING_BUFFER_MINUTES: u64 = 5;
 
 /// Default path for configuration.
 const CONFIG_PATH: &str = "config/config.toml";
@@ -173,7 +167,7 @@ async fn main() -> Result<()> {
 
     // Create API clients
     let gitlab_client = GitLabClient::new(&config.gitlab);
-    let hetzner_client = HetznerClient::new(&config.hetzner);
+    let scaleway_client = ScalewayClient::new(&config.scaleway);
 
     // Generate cloud-init template
     let cloud_init = generate_cloud_init(&runner_config);
@@ -182,8 +176,8 @@ async fn main() -> Result<()> {
     let mut state =
         OrchestratorState::with_persistence(STATE_PATH).context("Error loading state")?;
 
-    // Verify that saved state matches Hetzner
-    verify_state_with_hetzner(&hetzner_client, &config.runner.name, &mut state).await?;
+    // Verify that saved state matches Scaleway
+    verify_state_with_scaleway(&scaleway_client, &config.runner.name, &mut state).await?;
 
     // Polling interval (Debug: 5s, Release: from config)
     let poll_interval_secs = if is_debug_build() {
@@ -203,7 +197,7 @@ async fn main() -> Result<()> {
     loop {
         if let Err(e) = orchestration_tick(
             &gitlab_client,
-            &hetzner_client,
+            &scaleway_client,
             &csv_logger,
             &cloud_init,
             &config,
@@ -219,24 +213,24 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Verifies that the saved state matches Hetzner.
+/// Verifies that the saved state matches Scaleway.
 ///
 /// Possible scenarios:
-/// - State says server exists, Hetzner too → OK, keep state
-/// - State says server exists, Hetzner doesn't → Clear state
-/// - State says no server, Hetzner has one → Update state (emergency)
+/// - State says server exists, Scaleway too → OK, keep state
+/// - State says server exists, Scaleway doesn't → Clear state
+/// - State says no server, Scaleway has one → Update state (emergency)
 /// - Both say no server → OK
-async fn verify_state_with_hetzner(
-    hetzner_client: &HetznerClient,
+async fn verify_state_with_scaleway(
+    scaleway_client: &ScalewayClient,
     server_name: &str,
     state: &mut OrchestratorState,
 ) -> Result<()> {
-    info!("Verifying state with Hetzner API...");
+    info!("Verifying state with Scaleway API...");
 
-    let hetzner_server = hetzner_client.find_server_by_name(server_name).await?;
+    let scaleway_server = scaleway_client.find_server_by_name(server_name).await?;
 
-    match (&state.runner, hetzner_server) {
-        // State and Hetzner match - server exists
+    match (&state.runner, scaleway_server) {
+        // State and Scaleway match - server exists
         (Some(runner), Some(server)) if runner.server_id == server.id => {
             info!(
                 "State verified: Server {} (ID: {}) exists, running for {} minutes",
@@ -246,10 +240,10 @@ async fn verify_state_with_hetzner(
             );
         }
 
-        // State says server exists, but Hetzner doesn't know it anymore
+        // State says server exists, but Scaleway doesn't know it anymore
         (Some(runner), None) => {
             warn!(
-                "State inconsistency: Server {} (ID: {}) no longer exists at Hetzner!",
+                "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
                 runner.server_name, runner.server_id
             );
             warn!("Clearing state...");
@@ -259,23 +253,23 @@ async fn verify_state_with_hetzner(
         // State says server exists, but with different ID (very unlikely)
         (Some(runner), Some(server)) => {
             warn!(
-                "State inconsistency: State knows server ID {}, Hetzner has ID {}!",
+                "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
                 runner.server_id, server.id
             );
-            warn!("Updating state with Hetzner data (creation time unknown)...");
-            let new_runner = RunnerState::new(server.id, server.name);
-            state.set_runner(new_runner);
+            warn!("Updating state with Scaleway data (creation time unknown)...");
+            let volume_ids = server_volume_ids(&server);
+            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
         }
 
-        // State says no server, but Hetzner has one (emergency recovery)
+        // State says no server, but Scaleway has one (emergency recovery)
         (None, Some(server)) => {
             warn!(
                 "Orphaned server found: {} (ID: {}) - not in state!",
                 server.name, server.id
             );
             warn!("Adding to state (creation time unknown)...");
-            let new_runner = RunnerState::new(server.id, server.name);
-            state.set_runner(new_runner);
+            let volume_ids = server_volume_ids(&server);
+            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
         }
 
         // All OK - no server
@@ -290,7 +284,7 @@ async fn verify_state_with_hetzner(
 /// One pass of the orchestration logic.
 async fn orchestration_tick(
     gitlab_client: &GitLabClient,
-    hetzner_client: &HetznerClient,
+    scaleway_client: &ScalewayClient,
     csv_logger: &CsvLogger,
     cloud_init: &str,
     config: &Config,
@@ -313,7 +307,7 @@ async fn orchestration_tick(
             );
 
             create_runner(
-                hetzner_client,
+                scaleway_client,
                 csv_logger,
                 cloud_init,
                 config,
@@ -336,7 +330,7 @@ async fn orchestration_tick(
         // No active jobs
         if state.has_runner() {
             // Server is running, but no jobs anymore - check if we should delete
-            maybe_delete_runner(hetzner_client, csv_logger, config, state).await?;
+            maybe_delete_runner(scaleway_client, csv_logger, config, state).await?;
         } else {
             info!("No active jobs, no server active - waiting...");
         }
@@ -347,7 +341,7 @@ async fn orchestration_tick(
 
 /// Creates a new runner server.
 async fn create_runner(
-    hetzner_client: &HetznerClient,
+    scaleway_client: &ScalewayClient,
     csv_logger: &CsvLogger,
     cloud_init: &str,
     config: &Config,
@@ -357,17 +351,16 @@ async fn create_runner(
 ) -> Result<()> {
     info!("Creating new runner server...");
 
-    let server = hetzner_client
+    let server = scaleway_client
         .create_server(&config.runner.name, cloud_init)
         .await
         .context("Error creating server")?;
 
-    // Update state
-    let runner_state = RunnerState::new(server.id, server.name.clone());
+    let volume_ids = server_volume_ids(&server);
+    let runner_state = RunnerState::new(server.id.clone(), server.name.clone(), volume_ids);
     state.set_runner(runner_state);
 
-    // CSV log
-    if let Err(e) = csv_logger.log_start(server.id, project, pipeline_id, "pipeline_pending") {
+    if let Err(e) = csv_logger.log_start(&server.id, project, pipeline_id, "pipeline_pending") {
         warn!("Error in CSV logging: {}", e);
     }
 
@@ -376,11 +369,8 @@ async fn create_runner(
 }
 
 /// Checks if the server should be deleted and performs deletion if so.
-///
-/// In debug build, the server is deleted immediately.
-/// In release build, it waits for optimal billing time.
 async fn maybe_delete_runner(
-    hetzner_client: &HetznerClient,
+    scaleway_client: &ScalewayClient,
     csv_logger: &CsvLogger,
     config: &Config,
     state: &mut OrchestratorState,
@@ -391,53 +381,32 @@ async fn maybe_delete_runner(
     };
 
     let uptime = runner.uptime_minutes();
+    let min_lifetime = config.runner.min_lifetime_minutes;
 
-    // DEBUG BUILD: Delete immediately without waiting for billing
     if is_debug_build() {
         info!(
             "[DEBUG] Server running for {}min - deleting immediately (no pipelines active)",
             uptime
         );
-        delete_runner(hetzner_client, csv_logger, state, "debug_immediate_delete").await?;
+        delete_runner(scaleway_client, csv_logger, state, "debug_immediate_delete").await?;
         return Ok(());
     }
 
-    // RELEASE BUILD: Wait for optimal billing time
-    let min_lifetime = config.runner.min_lifetime_minutes;
-    let minutes_to_billing = runner.minutes_until_next_billing_cycle();
-
-    // Check if optimal delete time
-    let should_delete = runner.should_delete(min_lifetime, BILLING_BUFFER_MINUTES);
-
-    // Or: Minimum runtime reached and we don't want to wait forever
-    // (e.g., when we're just past a full hour)
-    let can_force_delete = runner.can_force_delete(min_lifetime);
-
-    if should_delete {
-        // Optimal time - delete
-        delete_runner(hetzner_client, csv_logger, state, "optimal_billing_time").await?;
-    } else if can_force_delete && minutes_to_billing > 55 {
-        // We're just past a full hour and minimum runtime is reached
-        // Deleting makes sense, otherwise we'd wait almost a full hour
-        info!(
-            "Force-delete: Minimum runtime reached ({}min), {} minutes until billing",
-            uptime, minutes_to_billing
-        );
-        delete_runner(hetzner_client, csv_logger, state, "all_pipelines_done").await?;
+    if uptime >= min_lifetime as u64 {
+        delete_runner(scaleway_client, csv_logger, state, "all_pipelines_done").await?;
     } else {
-        // Wait some more
         info!(
-            "Server running for {}min, no pipelines active. {} minutes until billing - waiting...",
-            uptime, minutes_to_billing
+            "Server running for {}min (minimum {}min), no pipelines active - waiting...",
+            uptime, min_lifetime
         );
     }
 
     Ok(())
 }
 
-/// Deletes the runner server.
+/// Terminates the runner server and removes its volumes.
 async fn delete_runner(
-    hetzner_client: &HetznerClient,
+    scaleway_client: &ScalewayClient,
     csv_logger: &CsvLogger,
     state: &mut OrchestratorState,
     reason: &str,
@@ -447,23 +416,23 @@ async fn delete_runner(
         None => return Ok(()),
     };
 
-    let server_id = runner.server_id;
+    let server_id = runner.server_id.clone();
+    let volume_ids = runner.volume_ids.clone();
     let uptime = runner.uptime_minutes();
 
     info!("Deleting runner server (reason: {})", reason);
 
-    // Delete server
-    hetzner_client
-        .delete_server(server_id)
+    scaleway_client
+        .terminate_server(&server_id)
         .await
-        .context("Error deleting server")?;
+        .context("Error terminating server")?;
 
-    // CSV log
-    if let Err(e) = csv_logger.log_stop(server_id, reason, uptime) {
+    scaleway_client.delete_volumes(&volume_ids).await;
+
+    if let Err(e) = csv_logger.log_stop(&server_id, reason, uptime) {
         warn!("Error in CSV logging: {}", e);
     }
 
-    // Reset state
     state.clear_runner();
 
     info!("Runner server deleted (runtime: {} minutes)", uptime);

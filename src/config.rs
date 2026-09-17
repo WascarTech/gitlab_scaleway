@@ -25,7 +25,7 @@ pub enum ConfigError {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub gitlab: GitLabConfig,
-    pub hetzner: HetznerConfig,
+    pub scaleway: ScalewayConfig,
     pub runner: RunnerConfig,
 }
 
@@ -41,24 +41,8 @@ pub struct GitLabConfig {
     pub tag_filter: Option<Vec<String>>,
 }
 
-/// Hetzner Cloud configuration.
-#[derive(Debug, Deserialize, Clone)]
-pub struct HetznerConfig {
-    /// Hetzner API Token
-    pub token: String,
-    /// Server type (e.g., "ccx23" for AMD dedicated CPU)
-    pub server_type: String,
-    /// Datacenter location (e.g., "nbg1", "fsn1", "hel1")
-    pub location: String,
-    /// OS Image (e.g., "ubuntu-24.04")
-    pub image: String,
-    /// Name of the SSH key in Hetzner Cloud
-    pub ssh_key_name: String,
-}
-
 /// Scaleway Instances configuration.
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // wired into Config in Task 2
 pub struct ScalewayConfig {
     /// Scaleway IAM API secret key
     pub token: String,
@@ -93,7 +77,7 @@ pub fn default_volume_type() -> String {
 /// Runner-specific configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RunnerConfig {
-    /// Name of the server in Hetzner Cloud
+    /// Name of the server in Scaleway
     pub name: String,
     /// Minimum runtime in minutes before the server can be deleted
     #[serde(default = "default_min_lifetime")]
@@ -130,7 +114,13 @@ impl Config {
 
         info!("Configuration loaded successfully");
         info!("  GitLab URL: {}", config.gitlab.url);
-        info!("  Hetzner server type: {}", config.hetzner.server_type);
+        info!(
+            "  Scaleway zone: {} (type: {}, volume: {} GB {})",
+            config.scaleway.zone,
+            config.scaleway.server_type,
+            config.scaleway.volume_size_gb,
+            config.scaleway.volume_type
+        );
         info!("  Runner name: {}", config.runner.name);
 
         Ok(config)

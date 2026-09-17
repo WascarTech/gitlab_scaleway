@@ -24,23 +24,22 @@ pub enum StateError {
 }
 
 /// State of an active runner.
-///
-/// NOTE: `triggered_by_project` and `triggered_by_pipeline` were removed -
-/// this information is passed directly during CSV logging and doesn't need
-/// to be stored in state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerState {
-    /// Hetzner server ID
-    pub server_id: u64,
+    /// Scaleway server UUID
+    pub server_id: String,
     /// Server name
     pub server_name: String,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
+    /// IDs of volumes attached at creation, deleted after termination
+    #[serde(default)]
+    pub volume_ids: Vec<String>,
 }
 
 impl RunnerState {
     /// Creates a new runner state with current timestamp.
-    pub fn new(server_id: u64, server_name: String) -> Self {
+    pub fn new(server_id: String, server_name: String, volume_ids: Vec<String>) -> Self {
         let created_at = Utc::now();
         info!(
             "Runner state created: Server {} (ID: {})",
@@ -51,84 +50,14 @@ impl RunnerState {
             server_id,
             server_name,
             created_at,
+            volume_ids,
         }
     }
-
-    // NOTE: `with_created_at()` was removed - state is now deserialized via JSON,
-    // which automatically restores `created_at`.
 
     /// Calculates how long the server has been running (in minutes).
     pub fn uptime_minutes(&self) -> u64 {
         let duration = Utc::now().signed_duration_since(self.created_at);
         duration.num_minutes().max(0) as u64
-    }
-
-    /// Checks if the server has reached the minimum runtime.
-    ///
-    /// # Arguments
-    /// * `min_minutes` - Minimum runtime in minutes
-    pub fn has_min_uptime(&self, min_minutes: u32) -> bool {
-        self.uptime_minutes() >= min_minutes as u64
-    }
-
-    /// Calculates minutes until the next billing cycle.
-    ///
-    /// Hetzner charges per started hour **from server creation**,
-    /// not per clock hour!
-    pub fn minutes_until_next_billing_cycle(&self) -> u64 {
-        let uptime = self.uptime_minutes();
-        let minutes_in_current_billing_hour = uptime % 60;
-
-        if minutes_in_current_billing_hour == 0 && uptime > 0 {
-            60 // Exactly at hour boundary = 60 minutes until next
-        } else {
-            60 - minutes_in_current_billing_hour
-        }
-    }
-
-    /// Checks if it's a good time to delete.
-    ///
-    /// Ideal: 5 minutes before the next full hour,
-    /// to optimally utilize the billing cycle.
-    pub fn should_delete(&self, min_lifetime_minutes: u32, buffer_minutes: u64) -> bool {
-        let uptime = self.uptime_minutes();
-        let minutes_to_billing = self.minutes_until_next_billing_cycle();
-
-        debug!(
-            "Delete check: uptime={}min, min_lifetime={}min, until_billing={}min, buffer={}min",
-            uptime, min_lifetime_minutes, minutes_to_billing, buffer_minutes
-        );
-
-        // Minimum runtime must be reached
-        if uptime < min_lifetime_minutes as u64 {
-            debug!("Minimum runtime not yet reached");
-            return false;
-        }
-
-        // Ideally delete 5 minutes before the next full hour
-        // OR if we've already run for a full hour+ and are close to the next one
-        if minutes_to_billing <= buffer_minutes {
-            info!(
-                "Good time to delete: {} minutes until next billing cycle",
-                minutes_to_billing
-            );
-            return true;
-        }
-
-        // If we're well over the minimum runtime (e.g., 50+ minutes),
-        // and there are no active pipelines, also delete
-        // (checked in main loop)
-
-        debug!("Not yet the optimal delete time");
-        false
-    }
-
-    /// Force-delete check: Minimum runtime reached, regardless of billing cycle.
-    ///
-    /// Used when no pipelines are active anymore and we don't want
-    /// to wait for the optimal time.
-    pub fn can_force_delete(&self, min_lifetime_minutes: u32) -> bool {
-        self.has_min_uptime(min_lifetime_minutes)
     }
 }
 
@@ -251,10 +180,15 @@ mod tests {
 
     #[test]
     fn test_runner_state_creation() {
-        let state = RunnerState::new(12345, "test-runner".to_string());
+        let state = RunnerState::new(
+            "server-uuid".to_string(),
+            "test-runner".to_string(),
+            vec!["vol-1".to_string()],
+        );
 
-        assert_eq!(state.server_id, 12345);
+        assert_eq!(state.server_id, "server-uuid");
         assert_eq!(state.server_name, "test-runner");
+        assert_eq!(state.volume_ids, vec!["vol-1".to_string()]);
         assert!(state.uptime_minutes() < 1);
     }
 
@@ -263,7 +197,11 @@ mod tests {
         let mut state = OrchestratorState::new();
         assert!(!state.has_runner());
 
-        let runner = RunnerState::new(12345, "test-runner".to_string());
+        let runner = RunnerState::new(
+            "server-uuid".to_string(),
+            "test-runner".to_string(),
+            vec![],
+        );
         state.set_runner(runner);
 
         assert!(state.has_runner());
@@ -274,11 +212,28 @@ mod tests {
 
     #[test]
     fn test_state_serialization() {
-        let runner = RunnerState::new(12345, "test-runner".to_string());
+        let runner = RunnerState::new(
+            "server-uuid".to_string(),
+            "test-runner".to_string(),
+            vec!["vol-1".to_string()],
+        );
         let json = serde_json::to_string(&runner).unwrap();
         let restored: RunnerState = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.server_id, 12345);
+        assert_eq!(restored.server_id, "server-uuid");
         assert_eq!(restored.server_name, "test-runner");
+        assert_eq!(restored.volume_ids, vec!["vol-1".to_string()]);
+    }
+
+    #[test]
+    fn test_state_without_volume_ids_still_loads() {
+        let json = r#"{
+            "server_id": "server-uuid",
+            "server_name": "test-runner",
+            "created_at": "2026-01-14T10:30:00Z"
+        }"#;
+        let restored: RunnerState = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.server_id, "server-uuid");
+        assert!(restored.volume_ids.is_empty());
     }
 }
