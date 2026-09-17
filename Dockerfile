@@ -1,19 +1,20 @@
-
-FROM rust:1.91-bullseye AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /app
 
-ARG service
-ARG features
+COPY Cargo.toml Cargo.lock ./
 
-COPY . .
+RUN mkdir src \
+    && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --locked
 
-RUN cargo build --release
+COPY src ./src
+COPY assets ./assets
 
-FROM debian:bullseye-slim AS runtime
+RUN touch src/main.rs \
+    && cargo build --release --locked
 
-ARG service
-
+FROM debian:bookworm-slim AS runtime
 
 ENV USER=scw
 ENV UID=42069
@@ -28,12 +29,11 @@ RUN adduser \
     "${USER}"
 
 # Install ca-certificates for HTTPS support
-RUN apt-get update
-RUN apt-get install -y ca-certificates
-RUN rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 
 COPY --from=builder /app/target/release/gitlab_scaleway /app/app
 

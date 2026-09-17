@@ -91,6 +91,18 @@ cargo run --release
 ./target/release/gitlab_scaleway
 ```
 
+### Docker image
+
+A prebuilt image is published to GitHub Container Registry on every push to `master`:
+
+```bash
+docker run -d --restart always \
+  -v ./config:/app/config \
+  ghcr.io/wascartech/gitlab_scaleway:latest
+```
+
+Version tags (`v1.2.3`) publish `:1.2.3` and `:1.2` tags as well.
+
 ## Configuration
 
 ### config/config.toml

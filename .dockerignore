@@ -1,0 +1,25 @@
+# Build artifacts
+/target
+
+# VCS
+.git
+.gitignore
+
+# Local configuration and runtime data (may contain secrets)
+/config
+/logs
+
+# Docs and CI meta
+/docs
+/.github
+README.md
+LICENSE
+
+# Local compose / editor files
+/docker-compose.yml
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
