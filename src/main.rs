@@ -20,6 +20,8 @@ mod config;
 mod csv_log;
 mod gitlab;
 mod hetzner;
+#[allow(dead_code)] // wired in Task 2
+mod scaleway;
 mod state;
 
 use std::path::Path;

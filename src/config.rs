@@ -56,6 +56,40 @@ pub struct HetznerConfig {
     pub ssh_key_name: String,
 }
 
+/// Scaleway Instances configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // wired into Config in Task 2
+pub struct ScalewayConfig {
+    /// Scaleway IAM API secret key
+    pub token: String,
+    /// Scaleway Project ID that owns the runner
+    pub project_id: String,
+    /// Availability Zone (e.g. "fr-par-1")
+    pub zone: String,
+    /// Instance type (e.g. "PRO2-XS", "PLAY2-PICO")
+    pub server_type: String,
+    /// Marketplace image label or local image UUID (e.g. "ubuntu_noble")
+    pub image: String,
+    /// Optional SSH public key injected via an AUTHORIZED_KEY tag
+    pub ssh_public_key: Option<String>,
+    /// Root volume size in GB (minimum 10)
+    #[serde(default = "default_volume_size")]
+    pub volume_size_gb: u32,
+    /// Root volume type: "sbs_volume" (default) or "l_ssd"
+    #[serde(default = "default_volume_type")]
+    pub volume_type: String,
+}
+
+/// Default root volume size: 50 GB.
+pub fn default_volume_size() -> u32 {
+    50
+}
+
+/// Default root volume type: Block Storage.
+pub fn default_volume_type() -> String {
+    "sbs_volume".to_string()
+}
+
 /// Runner-specific configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RunnerConfig {
@@ -128,5 +162,41 @@ mod tests {
     fn test_default_values() {
         assert_eq!(default_min_lifetime(), 20);
         assert_eq!(default_poll_interval(), 30);
+    }
+
+    #[test]
+    fn test_scaleway_defaults() {
+        let toml = r#"
+token = "scw-secret"
+project_id = "11111111-1111-1111-1111-111111111111"
+zone = "fr-par-1"
+server_type = "PRO2-XS"
+image = "ubuntu_noble"
+"#;
+        let config: super::ScalewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.volume_size_gb, 50);
+        assert_eq!(config.volume_type, "sbs_volume");
+        assert!(config.ssh_public_key.is_none());
+    }
+
+    #[test]
+    fn test_scaleway_overrides() {
+        let toml = r#"
+token = "scw-secret"
+project_id = "11111111-1111-1111-1111-111111111111"
+zone = "nl-ams-1"
+server_type = "DEV1-M"
+image = "ubuntu_noble"
+ssh_public_key = "ssh-ed25519 AAAA user@host"
+volume_size_gb = 120
+volume_type = "l_ssd"
+"#;
+        let config: super::ScalewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.volume_size_gb, 120);
+        assert_eq!(config.volume_type, "l_ssd");
+        assert_eq!(
+            config.ssh_public_key.as_deref(),
+            Some("ssh-ed25519 AAAA user@host")
+        );
     }
 }
