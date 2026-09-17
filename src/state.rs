@@ -197,11 +197,7 @@ mod tests {
         let mut state = OrchestratorState::new();
         assert!(!state.has_runner());
 
-        let runner = RunnerState::new(
-            "server-uuid".to_string(),
-            "test-runner".to_string(),
-            vec![],
-        );
+        let runner = RunnerState::new("server-uuid".to_string(), "test-runner".to_string(), vec![]);
         state.set_runner(runner);
 
         assert!(state.has_runner());

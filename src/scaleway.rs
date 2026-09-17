@@ -570,8 +570,18 @@ mod tests {
     #[test]
     fn test_server_volume_ids_sorted() {
         let mut volumes = HashMap::new();
-        volumes.insert("1".to_string(), Volume { id: "vol-b".to_string() });
-        volumes.insert("0".to_string(), Volume { id: "vol-a".to_string() });
+        volumes.insert(
+            "1".to_string(),
+            Volume {
+                id: "vol-b".to_string(),
+            },
+        );
+        volumes.insert(
+            "0".to_string(),
+            Volume {
+                id: "vol-a".to_string(),
+            },
+        );
         let mut s = server("id-1", "runner");
         s.volumes = volumes;
         assert_eq!(server_volume_ids(&s), vec!["vol-a", "vol-b"]);
