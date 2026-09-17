@@ -92,6 +92,14 @@ const fn is_debug_build() -> bool {
     cfg!(debug_assertions)
 }
 
+/// Returns true when an idle server may be terminated.
+///
+/// Debug builds always terminate immediately; release builds wait until the
+/// minimum lifetime has elapsed.
+fn should_terminate(uptime_minutes: u64, min_lifetime_minutes: u32, is_debug: bool) -> bool {
+    is_debug || uptime_minutes >= min_lifetime_minutes as u64
+}
+
 /// Creates the example configuration if it doesn't exist.
 fn ensure_example_config() {
     if !Path::new(CONFIG_EXAMPLE_PATH).exists() {
@@ -383,25 +391,25 @@ async fn maybe_delete_runner(
     let uptime = runner.uptime_minutes();
     let min_lifetime = config.runner.min_lifetime_minutes;
 
-    if is_debug_build() {
-        info!(
-            "[DEBUG] Server running for {}min - deleting immediately (no pipelines active)",
-            uptime
-        );
-        delete_runner(scaleway_client, csv_logger, state, "debug_immediate_delete").await?;
-        return Ok(());
-    }
-
-    if uptime >= min_lifetime as u64 {
-        delete_runner(scaleway_client, csv_logger, state, "all_pipelines_done").await?;
-    } else {
+    if !should_terminate(uptime, min_lifetime, is_debug_build()) {
         info!(
             "Server running for {}min (minimum {}min), no pipelines active - waiting...",
             uptime, min_lifetime
         );
+        return Ok(());
     }
 
-    Ok(())
+    let reason = if is_debug_build() {
+        info!(
+            "[DEBUG] Server running for {}min - deleting immediately (no pipelines active)",
+            uptime
+        );
+        "debug_immediate_delete"
+    } else {
+        "all_pipelines_done"
+    };
+
+    delete_runner(scaleway_client, csv_logger, state, reason).await
 }
 
 /// Terminates the runner server and removes its volumes.
@@ -437,4 +445,26 @@ async fn delete_runner(
 
     info!("Runner server deleted (runtime: {} minutes)", uptime);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_terminate_debug_always() {
+        assert!(should_terminate(0, 20, true));
+        assert!(should_terminate(1, 999, true));
+    }
+
+    #[test]
+    fn test_should_terminate_before_min_lifetime() {
+        assert!(!should_terminate(19, 20, false));
+    }
+
+    #[test]
+    fn test_should_terminate_at_or_after_min_lifetime() {
+        assert!(should_terminate(20, 20, false));
+        assert!(should_terminate(65, 20, false));
+    }
 }
