@@ -141,7 +141,7 @@ Client responsibilities:
   JSON failures to `ScalewayError::Parse`.
 - `find_server_by_name(name) -> Option<Server>` — query `?name=`, then return
   only an exact-name match.
-- `create_server(name, cloud_init) -> (Server, Vec<String>)`:
+- `create_server(name, cloud_init) -> Server`:
   1. `POST /servers` with body:
      ```json
      {
@@ -165,7 +165,8 @@ Client responsibilities:
   3. `PATCH /servers/{id}/user_data/cloud-init` with the raw cloud-init text.
   4. `POST /servers/{id}/action` `{"action":"poweron"}`.
   5. Wait for state `running`.
-  6. Collect and return the volume IDs from the create response.
+  6. Return the server; the caller derives volume IDs with the
+     `server_volume_ids` helper.
 - `terminate_server(server_id)` — `POST .../action` `{"action":"terminate"}`;
   treat 404 as success. If terminate fails (e.g. the adopted server is stopped
   or in another non-terminable state), fall back: if the server is already
