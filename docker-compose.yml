@@ -1,5 +1,5 @@
 services:
-  hcloud-starter:
+  scaleway-starter:
     build: .
     volumes:
       - ./config:/app/config

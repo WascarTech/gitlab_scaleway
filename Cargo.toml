@@ -1,8 +1,8 @@
 [package]
-name = "gitlab_hcloud"
-version = "0.2.0"
+name = "gitlab_scaleway"
+version = "0.3.0"
 edition = "2021"
-description = "Automatic Hetzner server provisioning for GitLab CI runners"
+description = "Automatic Scaleway server provisioning for GitLab CI runners"
 license = "MIT"
 authors = ["Maximilian Kutschka"]
 

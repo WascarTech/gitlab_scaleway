@@ -15,7 +15,7 @@ FROM debian:bullseye-slim AS runtime
 ARG service
 
 
-ENV USER=hcloud
+ENV USER=scw
 ENV UID=42069
 
 RUN adduser \
@@ -35,11 +35,11 @@ RUN rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 
-COPY --from=builder /app/target/release/gitlab_hcloud /app/app
+COPY --from=builder /app/target/release/gitlab_scaleway /app/app
 
 RUN chown -R "${USER}:${USER}" /app
 
-# Use the flexi user
-USER hcloud:hcloud
+# Use the unprivileged user
+USER scw:scw
 # Set entrypoint to run backend
 ENTRYPOINT ["/app/app"]

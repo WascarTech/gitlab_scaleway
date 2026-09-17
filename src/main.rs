@@ -63,22 +63,29 @@ url = "https://gitlab.example.com"
 token = "glpat-xxxxxxxxxxxxxxxxxxxx"
 # Optional: only spin up a runner when a pending job has one of these tags.
 # Remove or leave empty to react to all pending jobs.
-# tag_filter = ["hetzner", "my-runner-tag"]
+# tag_filter = ["scaleway", "my-runner-tag"]
 
-[hetzner]
-# Hetzner Cloud API Token
-token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-# Server type (e.g., cx22, ccx23, cpx31)
-server_type = "ccx23"
-# Datacenter location (nbg1, fsn1, hel1, ash, hil)
-location = "nbg1"
-# OS Image
-image = "ubuntu-24.04"
-# Name of the SSH key in Hetzner Cloud
-ssh_key_name = "my-ssh-key"
+[scaleway]
+# Scaleway IAM API secret key
+token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# Scaleway Project ID that owns the runner
+project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# Availability Zone (fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1)
+zone = "fr-par-1"
+# Instance type (e.g. PLAY2-PICO, DEV1-M, PRO2-XS, PRO2-S)
+server_type = "PRO2-XS"
+# Marketplace image label or local image UUID
+image = "ubuntu_noble"
+# Optional: SSH public key for debugging, injected via an AUTHORIZED_KEY tag
+# ssh_public_key = "ssh-ed25519 AAAA... user@host"
+# Root volume size in GB (minimum 10). 50+ recommended for CI caches.
+volume_size_gb = 50
+# Root volume type: "sbs_volume" (Block Storage, default) or "l_ssd" (local,
+# only on DEV1/GP1 instance types)
+volume_type = "sbs_volume"
 
 [runner]
-# Name of the server in Hetzner Cloud
+# Name of the server in Scaleway
 name = "flexi-runner"
 # Minimum runtime in minutes before the server can be deleted
 min_lifetime_minutes = 20
