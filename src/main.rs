@@ -185,7 +185,11 @@ async fn main() -> Result<()> {
     let scaleway_client = ScalewayClient::new(&config.scaleway);
 
     // Generate cloud-init template
-    let cloud_init = generate_cloud_init(&runner_config);
+    let cloud_init = generate_cloud_init(
+        &runner_config,
+        config.runner.run_untagged,
+        config.runner.protected,
+    );
 
     // Load orchestrator state with persistence
     let mut state =
