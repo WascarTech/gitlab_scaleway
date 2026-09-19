@@ -85,6 +85,12 @@ pub struct RunnerConfig {
     /// Polling interval in seconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
+    /// Whether the runner should accept untagged jobs
+    #[serde(default = "default_run_untagged")]
+    pub run_untagged: bool,
+    /// Whether the runner should only run jobs on protected branches
+    #[serde(default = "default_protected")]
+    pub protected: bool,
 }
 
 /// Default value for minimum lifetime: 20 minutes
@@ -95,6 +101,16 @@ fn default_min_lifetime() -> u32 {
 /// Default value for polling interval: 30 seconds
 fn default_poll_interval() -> u64 {
     30
+}
+
+/// Default: accept untagged jobs (GitLab default behavior)
+fn default_run_untagged() -> bool {
+    true
+}
+
+/// Default: do not restrict to protected branches only
+fn default_protected() -> bool {
+    false
 }
 
 impl Config {
