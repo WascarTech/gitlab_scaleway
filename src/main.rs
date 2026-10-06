@@ -83,6 +83,10 @@ volume_size_gb = 50
 # Root volume type: "sbs_volume" (Block Storage, default) or "l_ssd" (local,
 # only on DEV1/GP1 instance types)
 volume_type = "sbs_volume"
+# Optional Block Storage IOPS class: 5000 (default) or 15000. Only applies to
+# "sbs_volume"; ignored for "l_ssd". 15K requires the instance type to have at
+# least 3 GiB/s of block bandwidth.
+# volume_iops = 15000
 
 [runner]
 # Name of the server in Scaleway

@@ -26,6 +26,12 @@ const STATE_POLL_INTERVAL_SECS: u64 = 3;
 const MIN_VOLUME_SIZE_GB: u32 = 10;
 /// Bytes in one gigabyte, as expected by the Scaleway API.
 const BYTES_PER_GB: u64 = 1_000_000_000;
+/// Block Storage IOPS classes accepted by the Scaleway API.
+const ALLOWED_IOPS: [u32; 2] = [5_000, 15_000];
+/// Attempts to apply the IOPS class before giving up.
+const IOPS_UPDATE_ATTEMPTS: u32 = 3;
+/// Delay between IOPS update attempts, in seconds.
+const IOPS_UPDATE_DELAY_SECS: u64 = 3;
 
 /// Errors that can occur during Scaleway API calls.
 #[derive(Error, Debug)]
@@ -110,6 +116,11 @@ struct VolumeTemplate {
 }
 
 #[derive(Debug, Serialize)]
+struct UpdateVolumeIopsRequest {
+    perf_iops: u32,
+}
+
+#[derive(Debug, Serialize)]
 struct ActionRequest<'a> {
     action: &'a str,
 }
@@ -150,6 +161,31 @@ fn validate_volume_config(size_gb: u32, volume_type: &str) -> Result<(), Scalewa
     Ok(())
 }
 
+/// Validates the configured IOPS class, if any.
+fn validate_volume_iops(iops: Option<u32>) -> Result<(), ScalewayError> {
+    if let Some(iops) = iops {
+        if !ALLOWED_IOPS.contains(&iops) {
+            return Err(ScalewayError::InvalidConfig(format!(
+                "volume_iops must be 5000 or 15000, got {}",
+                iops
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Decides which IOPS class to apply to the root volume.
+///
+/// The IOPS class only exists for Block Storage (`sbs_volume`); it is ignored
+/// for local SSD (`l_ssd`).
+fn iops_to_apply(volume_type: &str, volume_iops: Option<u32>) -> Option<u32> {
+    match (volume_type, volume_iops) {
+        (_, None) => None,
+        ("sbs_volume", Some(iops)) => Some(iops),
+        _ => None,
+    }
+}
+
 /// Extracts volume IDs from a server, sorted by volume key for determinism.
 pub fn server_volume_ids(server: &Server) -> Vec<String> {
     let mut entries: Vec<(String, String)> = server
@@ -167,6 +203,7 @@ fn build_create_request(
     name: &str,
 ) -> Result<CreateServerRequest, ScalewayError> {
     validate_volume_config(config.volume_size_gb, &config.volume_type)?;
+    validate_volume_iops(config.volume_iops)?;
 
     let mut tags = vec!["gitlab-runner".to_string()];
     if let Some(ref key) = config.ssh_public_key {
@@ -212,6 +249,9 @@ impl ScalewayClient {
             "  Volume: {} GB ({})",
             config.volume_size_gb, config.volume_type
         );
+        if let Some(iops) = iops_to_apply(&config.volume_type, config.volume_iops) {
+            info!("  Volume IOPS: {}", iops);
+        }
 
         Self {
             client: Client::new(),
@@ -265,6 +305,18 @@ impl ScalewayClient {
             .header("X-Auth-Token", &self.token)
             .header("Content-Type", "text/plain")
             .body(body.to_string())
+            .send()
+            .await?;
+        Self::handle_empty(response).await
+    }
+
+    async fn patch_json<B: Serialize>(&self, url: &str, body: &B) -> Result<(), ScalewayError> {
+        debug!("Scaleway API PATCH: {}", url);
+        let response = self
+            .client
+            .patch(url)
+            .header("X-Auth-Token", &self.token)
+            .json(body)
             .send()
             .await?;
         Self::handle_empty(response).await
@@ -353,6 +405,7 @@ impl ScalewayClient {
 
         self.wait_for_state(&server.id, "stopped", STOPPED_TIMEOUT_SECS)
             .await?;
+        self.apply_root_volume_iops(&server).await;
         self.patch_text(
             &format!("/servers/{}/user_data/cloud-init", server.id),
             cloud_init,
@@ -368,6 +421,71 @@ impl ScalewayClient {
         }
 
         Ok(server)
+    }
+
+    /// Applies the configured IOPS class to the server's root Block volume.
+    ///
+    /// The Instance API cannot set IOPS at creation time, so the class is set
+    /// afterwards via the Block Storage API. The volume is always created with
+    /// the `sbs` storage class, so switching between 5000 and 15000 IOPS is
+    /// permitted. Failures are logged but do not abort provisioning: the runner
+    /// remains usable at the default 5000 IOPS.
+    async fn apply_root_volume_iops(&self, server: &Server) {
+        let iops = match iops_to_apply(&self.config.volume_type, self.config.volume_iops) {
+            Some(iops) => iops,
+            None => {
+                if self.config.volume_iops.is_some() && self.config.volume_type == "l_ssd" {
+                    warn!(
+                        "volume_iops is ignored for volume_type 'l_ssd' (local SSD has no IOPS class)"
+                    );
+                }
+                return;
+            }
+        };
+
+        let volume_id = match server.volumes.get("0") {
+            Some(volume) => &volume.id,
+            None => {
+                warn!(
+                    "Could not find root volume of server {} to set IOPS {}",
+                    server.id, iops
+                );
+                return;
+            }
+        };
+
+        info!("Setting root volume {} IOPS to {}", volume_id, iops);
+        for attempt in 1..=IOPS_UPDATE_ATTEMPTS {
+            match self.update_volume_iops(volume_id, iops).await {
+                Ok(()) => {
+                    info!("Root volume {} now at {} IOPS", volume_id, iops);
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to set IOPS {} on volume {} (attempt {}/{}): {}",
+                        iops, volume_id, attempt, IOPS_UPDATE_ATTEMPTS, e
+                    );
+                    if attempt < IOPS_UPDATE_ATTEMPTS {
+                        sleep(Duration::from_secs(IOPS_UPDATE_DELAY_SECS)).await;
+                    }
+                }
+            }
+        }
+        warn!(
+            "Continuing without custom IOPS - root volume {} remains at the default class",
+            volume_id
+        );
+    }
+
+    /// Updates a Block volume's IOPS class via the Block Storage API.
+    async fn update_volume_iops(&self, volume_id: &str, iops: u32) -> Result<(), ScalewayError> {
+        let url = format!(
+            "{}/block/v1/zones/{}/volumes/{}",
+            SCALEWAY_API_URL, self.config.zone, volume_id
+        );
+        self.patch_json(&url, &UpdateVolumeIopsRequest { perf_iops: iops })
+            .await
     }
 
     async fn action(&self, server_id: &str, action: &str) -> Result<(), ScalewayError> {
@@ -538,6 +656,7 @@ mod tests {
             ssh_public_key: Some("ssh-ed25519 AAAA key".to_string()),
             volume_size_gb: 50,
             volume_type: "sbs_volume".to_string(),
+            volume_iops: None,
         };
         let request = build_create_request(&config, "flexi-runner").unwrap();
         assert_eq!(request.name, "flexi-runner");
@@ -562,6 +681,7 @@ mod tests {
             ssh_public_key: None,
             volume_size_gb: 50,
             volume_type: "sbs_volume".to_string(),
+            volume_iops: None,
         };
         let request = build_create_request(&config, "flexi-runner").unwrap();
         assert_eq!(request.tags, vec!["gitlab-runner".to_string()]);
@@ -585,5 +705,24 @@ mod tests {
         let mut s = server("id-1", "runner");
         s.volumes = volumes;
         assert_eq!(server_volume_ids(&s), vec!["vol-a", "vol-b"]);
+    }
+
+    #[test]
+    fn test_validate_volume_iops() {
+        assert!(validate_volume_iops(None).is_ok());
+        assert!(validate_volume_iops(Some(5_000)).is_ok());
+        assert!(validate_volume_iops(Some(15_000)).is_ok());
+        assert!(matches!(
+            validate_volume_iops(Some(10_000)),
+            Err(ScalewayError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_iops_to_apply() {
+        assert_eq!(iops_to_apply("sbs_volume", None), None);
+        assert_eq!(iops_to_apply("sbs_volume", Some(15_000)), Some(15_000));
+        assert_eq!(iops_to_apply("l_ssd", Some(15_000)), None);
+        assert_eq!(iops_to_apply("l_ssd", None), None);
     }
 }

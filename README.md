@@ -121,6 +121,7 @@ image = "ubuntu_noble"
 ssh_public_key = "ssh-ed25519 AAAA... user@host"  # optional
 volume_size_gb = 50              # minimum 10
 volume_type = "sbs_volume"       # or "l_ssd" on DEV1/GP1 types
+volume_iops = 15000              # optional: 5000 (default) or 15000, sbs_volume only
 
 [runner]
 name = "flexi-runner"
@@ -136,6 +137,8 @@ Scaleway's OS image default root volume is only about 10 GB, which is too small 
 
 - `sbs_volume` (default) - network Block Storage. Works with all current instance ranges. When the instance is terminated, the volume is detached and the orchestrator explicitly deletes it.
 - `l_ssd` - local SSD, only available on Development (DEV1) and first-generation General Purpose (GP1) instance types. It is deleted automatically when the instance is terminated.
+
+`volume_iops` selects the Block Storage performance class for `sbs_volume` roots: `5000` (default) or `15000` IOPS. The Instance API cannot set IOPS at creation time, so the orchestrator applies it through the Block Storage API once the instance is created. 15K requires the instance type to expose at least **3 GiB/s of block bandwidth**; otherwise 5000 IOPS is used. The setting is ignored for `l_ssd`.
 
 ### SSH access
 

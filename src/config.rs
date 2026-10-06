@@ -62,6 +62,9 @@ pub struct ScalewayConfig {
     /// Root volume type: "sbs_volume" (default) or "l_ssd"
     #[serde(default = "default_volume_type")]
     pub volume_type: String,
+    /// Block Storage IOPS class: 5000 (default) or 15000. Only applies to
+    /// `sbs_volume`; ignored for `l_ssd`.
+    pub volume_iops: Option<u32>,
 }
 
 /// Default root volume size: 50 GB.
@@ -115,11 +118,16 @@ impl Config {
         info!("Configuration loaded successfully");
         info!("  GitLab URL: {}", config.gitlab.url);
         info!(
-            "  Scaleway zone: {} (type: {}, volume: {} GB {})",
+            "  Scaleway zone: {} (type: {}, volume: {} GB {}, iops: {})",
             config.scaleway.zone,
             config.scaleway.server_type,
             config.scaleway.volume_size_gb,
-            config.scaleway.volume_type
+            config.scaleway.volume_type,
+            config
+                .scaleway
+                .volume_iops
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "default".to_string())
         );
         info!("  Runner name: {}", config.runner.name);
 
@@ -167,6 +175,7 @@ image = "ubuntu_noble"
         assert_eq!(config.volume_size_gb, 50);
         assert_eq!(config.volume_type, "sbs_volume");
         assert!(config.ssh_public_key.is_none());
+        assert!(config.volume_iops.is_none());
     }
 
     #[test]
@@ -180,10 +189,12 @@ image = "ubuntu_noble"
 ssh_public_key = "ssh-ed25519 AAAA user@host"
 volume_size_gb = 120
 volume_type = "l_ssd"
+volume_iops = 15000
 "#;
         let config: super::ScalewayConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.volume_size_gb, 120);
         assert_eq!(config.volume_type, "l_ssd");
+        assert_eq!(config.volume_iops, Some(15000));
         assert_eq!(
             config.ssh_public_key.as_deref(),
             Some("ssh-ed25519 AAAA user@host")
