@@ -127,7 +127,18 @@ volume_iops = 15000              # optional: 5000 (default) or 15000, sbs_volume
 name = "flexi-runner"
 min_lifetime_minutes = 20
 poll_interval_seconds = 30
+# Whether the runner should accept jobs without tags
+run_untagged = true
+# Whether the runner should only run jobs on protected branches
+protected = false
 ```
+
+### Runner Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `run_untagged` | boolean | `true` | If `true`, the runner will accept jobs that don't have any tags. If `false`, the runner will only accept jobs that match its tags. |
+| `protected` | boolean | `false` | If `true`, the runner will only run jobs on protected branches. If `false`, the runner will run jobs on all branches. |
 
 ### Storage
 
