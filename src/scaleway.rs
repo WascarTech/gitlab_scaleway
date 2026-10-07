@@ -34,6 +34,12 @@ const ALLOWED_IOPS: [u32; 2] = [5_000, 15_000];
 const IOPS_UPDATE_ATTEMPTS: u32 = 3;
 /// Delay between IOPS update attempts, in seconds.
 const IOPS_UPDATE_DELAY_SECS: u64 = 3;
+/// Max time to wait for a volume to be detached after server termination.
+const VOLUME_DETACH_TIMEOUT_SECS: u64 = 60;
+/// Attempts to delete a volume before giving up.
+const VOLUME_DELETE_ATTEMPTS: u32 = 3;
+/// Delay between volume deletion attempts, in seconds.
+const VOLUME_DELETE_DELAY_SECS: u64 = 3;
 
 /// Errors that can occur during Scaleway API calls.
 #[derive(Error, Debug)]
@@ -52,6 +58,9 @@ pub enum ScalewayError {
 
     #[error("Timed out waiting for server {server_id} to reach state '{desired}'")]
     Timeout { server_id: String, desired: String },
+
+    #[error("Timed out waiting for volume {volume_id} to detach")]
+    VolumeTimeout { volume_id: String },
 }
 
 /// A Scaleway Instance.
@@ -82,6 +91,36 @@ pub struct PublicIp {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Volume {
     pub id: String,
+}
+
+/// Block Storage volume status, as returned by the Block API.
+#[derive(Debug, Deserialize)]
+struct BlockVolume {
+    #[serde(default, alias = "state")]
+    status: String,
+}
+
+/// `GET /block/v1/.../volumes/{id}` returns the object directly.
+/// The wrapper variant is accepted defensively and is tried first.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BlockVolumeGetResponse {
+    Wrapped { volume: BlockVolume },
+    Direct(BlockVolume),
+}
+
+impl BlockVolumeGetResponse {
+    fn status(&self) -> &str {
+        match self {
+            Self::Wrapped { volume } => &volume.status,
+            Self::Direct(volume) => &volume.status,
+        }
+    }
+}
+
+/// Returns true when a Block volume is detached and safe to delete.
+fn block_volume_is_deletable(status: &str) -> bool {
+    status == "available"
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +332,17 @@ impl ScalewayClient {
             .post(&url)
             .header("X-Auth-Token", &self.token)
             .json(body)
+            .send()
+            .await?;
+        Self::handle_json(response).await
+    }
+
+    async fn get_url<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, ScalewayError> {
+        debug!("Scaleway API GET: {}", url);
+        let response = self
+            .client
+            .get(url)
+            .header("X-Auth-Token", &self.token)
             .send()
             .await?;
         Self::handle_json(response).await
@@ -542,22 +592,78 @@ impl ScalewayClient {
         }
     }
 
-    /// Deletes volumes via the Block Storage API. 404s are ignored because
-    /// `terminate` already removes local (`l_ssd`/`scratch`) volumes.
-    pub async fn delete_volumes(&self, volume_ids: &[String]) {
+    /// Deletes volumes via the Block Storage API.
+    ///
+    /// Waits for each volume to be detached before deleting. 404s count as
+    /// success (`terminate` already removed local volumes). Returns the IDs
+    /// that could not be deleted so callers can persist them for retry.
+    pub async fn delete_volumes(&self, volume_ids: &[String]) -> Vec<String> {
+        let mut failed = Vec::new();
         for volume_id in volume_ids {
+            if let Err(e) = self.delete_volume(volume_id).await {
+                warn!("Failed to delete volume {}: {}", volume_id, e);
+                failed.push(volume_id.clone());
+            }
+        }
+        failed
+    }
+
+    async fn get_block_volume(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<BlockVolumeGetResponse>, ScalewayError> {
+        let url = format!(
+            "{}/block/v1/zones/{}/volumes/{}",
+            SCALEWAY_API_URL, self.config.zone, volume_id
+        );
+        match self.get_url::<BlockVolumeGetResponse>(&url).await {
+            Ok(volume) => Ok(Some(volume)),
+            Err(ScalewayError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn wait_for_volume_detached(&self, volume_id: &str) -> Result<(), ScalewayError> {
+        let attempts = (VOLUME_DETACH_TIMEOUT_SECS / STATE_POLL_INTERVAL_SECS).max(1);
+        for _ in 0..attempts {
+            match self.get_block_volume(volume_id).await? {
+                None => return Ok(()),
+                Some(volume) if block_volume_is_deletable(volume.status()) => return Ok(()),
+                Some(_) => sleep(Duration::from_secs(STATE_POLL_INTERVAL_SECS)).await,
+            }
+        }
+        Err(ScalewayError::VolumeTimeout {
+            volume_id: volume_id.to_string(),
+        })
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> Result<(), ScalewayError> {
+        self.wait_for_volume_detached(volume_id).await?;
+        for attempt in 1..=VOLUME_DELETE_ATTEMPTS {
             let url = format!(
                 "{}/block/v1/zones/{}/volumes/{}",
                 SCALEWAY_API_URL, self.config.zone, volume_id
             );
             match self.delete_url(&url).await {
-                Ok(()) => info!("Deleted volume {}", volume_id),
+                Ok(()) => {
+                    info!("Deleted volume {}", volume_id);
+                    return Ok(());
+                }
                 Err(ScalewayError::Api { status: 404, .. }) => {
                     debug!("Volume {} already deleted", volume_id);
+                    return Ok(());
                 }
-                Err(e) => warn!("Failed to delete volume {}: {}", volume_id, e),
+                Err(e) if attempt == VOLUME_DELETE_ATTEMPTS => return Err(e),
+                Err(e) => {
+                    warn!(
+                        "Delete volume {} failed (attempt {}/{}): {}",
+                        volume_id, attempt, VOLUME_DELETE_ATTEMPTS, e
+                    );
+                    sleep(Duration::from_secs(VOLUME_DELETE_DELAY_SECS)).await;
+                }
             }
         }
+        unreachable!("loop always returns on the final attempt")
     }
 
     /// Polls until the server reaches the desired state or the timeout elapses.
@@ -736,6 +842,24 @@ mod tests {
             validate_volume_iops(Some(10_000)),
             Err(ScalewayError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn test_block_volume_is_deletable() {
+        assert!(block_volume_is_deletable("available"));
+        assert!(!block_volume_is_deletable("in_use"));
+        assert!(!block_volume_is_deletable("creating"));
+        assert!(!block_volume_is_deletable(""));
+    }
+
+    #[test]
+    fn test_block_volume_response_wrapped_and_direct() {
+        let wrapped: BlockVolumeGetResponse =
+            serde_json::from_str(r#"{"volume":{"id":"v1","status":"in_use"}}"#).unwrap();
+        assert_eq!(wrapped.status(), "in_use");
+        let direct: BlockVolumeGetResponse =
+            serde_json::from_str(r#"{"id":"v1","status":"available"}"#).unwrap();
+        assert_eq!(direct.status(), "available");
     }
 
     #[test]
