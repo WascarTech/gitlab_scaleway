@@ -20,6 +20,8 @@ const SCALEWAY_API_URL: &str = "https://api.scaleway.com";
 const STOPPED_TIMEOUT_SECS: u64 = 120;
 /// Max time to wait for a server to reach the `running` state.
 const RUNNING_TIMEOUT_SECS: u64 = 180;
+/// Max time to wait for a server to be fully deleted after terminate.
+const TERMINATED_TIMEOUT_SECS: u64 = 180;
 /// Interval between state polls.
 const STATE_POLL_INTERVAL_SECS: u64 = 3;
 /// Scaleway's minimum root volume size in GB.
@@ -501,18 +503,21 @@ impl ScalewayClient {
     }
 
     /// Terminates a server, falling back to poweroff+delete if needed.
+    ///
+    /// Waits until the server no longer exists so that its Block Storage
+    /// volumes are detached and can be deleted by the caller.
     pub async fn terminate_server(&self, server_id: &str) -> Result<(), ScalewayError> {
         info!("Terminating server: {}", server_id);
         match self.action(server_id, "terminate").await {
-            Ok(()) => {
-                info!("Server {} terminated", server_id);
-                Ok(())
-            }
+            Ok(()) => {}
             Err(e) => {
                 warn!("Terminate failed for {} ({}); falling back", server_id, e);
-                self.terminate_fallback(server_id).await
+                self.terminate_fallback(server_id).await?;
             }
         }
+        self.wait_for_server_gone(server_id).await?;
+        info!("Server {} terminated", server_id);
+        Ok(())
     }
 
     async fn terminate_fallback(&self, server_id: &str) -> Result<(), ScalewayError> {
@@ -578,6 +583,21 @@ impl ScalewayClient {
         Err(ScalewayError::Timeout {
             server_id: server_id.to_string(),
             desired: desired.to_string(),
+        })
+    }
+
+    /// Polls until the server no longer exists (termination complete).
+    pub async fn wait_for_server_gone(&self, server_id: &str) -> Result<(), ScalewayError> {
+        let attempts = (TERMINATED_TIMEOUT_SECS / STATE_POLL_INTERVAL_SECS).max(1);
+        for _ in 0..attempts {
+            if self.get_server(server_id).await?.is_none() {
+                return Ok(());
+            }
+            sleep(Duration::from_secs(STATE_POLL_INTERVAL_SECS)).await;
+        }
+        Err(ScalewayError::Timeout {
+            server_id: server_id.to_string(),
+            desired: "deleted".to_string(),
         })
     }
 }
