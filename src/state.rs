@@ -65,6 +65,8 @@ impl RunnerState {
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState {
     runner: Option<RunnerState>,
+    #[serde(default)]
+    pending_volume_ids: Vec<String>,
 }
 
 /// Orchestrator state - manages the entire application state.
@@ -74,6 +76,8 @@ pub struct OrchestratorState {
     pub runner: Option<RunnerState>,
     /// Path to the state file
     state_file_path: Option<std::path::PathBuf>,
+    /// Volume IDs whose deletion failed and that must be retried
+    pending_volume_ids: Vec<String>,
 }
 
 impl OrchestratorState {
@@ -83,6 +87,7 @@ impl OrchestratorState {
         Self {
             runner: None,
             state_file_path: None,
+            pending_volume_ids: Vec::new(),
         }
     }
 
@@ -94,6 +99,7 @@ impl OrchestratorState {
         let mut state = Self {
             runner: None,
             state_file_path: Some(path.clone()),
+            pending_volume_ids: Vec::new(),
         };
 
         // Try to load state
@@ -118,6 +124,7 @@ impl OrchestratorState {
         let content = std::fs::read_to_string(path)?;
         let persisted: PersistedState = serde_json::from_str(&content)?;
         self.runner = persisted.runner;
+        self.pending_volume_ids = persisted.pending_volume_ids;
         Ok(())
     }
 
@@ -126,6 +133,7 @@ impl OrchestratorState {
         if let Some(ref path) = self.state_file_path {
             let persisted = PersistedState {
                 runner: self.runner.clone(),
+                pending_volume_ids: self.pending_volume_ids.clone(),
             };
             let content = serde_json::to_string_pretty(&persisted)?;
             std::fs::write(path, content)?;
@@ -158,6 +166,25 @@ impl OrchestratorState {
         }
         self.runner = None;
 
+        if let Err(e) = self.save_to_file() {
+            warn!("Error saving state: {}", e);
+        }
+    }
+
+    /// Returns a copy of the volume IDs still awaiting deletion.
+    pub fn pending_volume_ids(&self) -> Vec<String> {
+        self.pending_volume_ids.clone()
+    }
+
+    /// Replaces the pending volume list, de-duplicating and persisting it.
+    pub fn set_pending_volumes(&mut self, volume_ids: Vec<String>) {
+        let mut deduped: Vec<String> = Vec::new();
+        for id in volume_ids {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        self.pending_volume_ids = deduped;
         if let Err(e) = self.save_to_file() {
             warn!("Error saving state: {}", e);
         }
@@ -219,6 +246,20 @@ mod tests {
         assert_eq!(restored.server_id, "server-uuid");
         assert_eq!(restored.server_name, "test-runner");
         assert_eq!(restored.volume_ids, vec!["vol-1".to_string()]);
+    }
+
+    #[test]
+    fn test_pending_volumes_round_trip() {
+        let mut state = OrchestratorState::new();
+        state.set_pending_volumes(vec!["vol-a".into(), "vol-b".into(), "vol-a".into()]);
+        assert_eq!(state.pending_volume_ids(), vec!["vol-a", "vol-b"]);
+    }
+
+    #[test]
+    fn test_pending_volumes_saved_to_file() {
+        let json = r#"{"runner": null}"#;
+        let p: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(p.pending_volume_ids.is_empty());
     }
 
     #[test]
