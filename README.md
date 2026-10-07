@@ -146,7 +146,7 @@ Scaleway's OS image default root volume is only about 10 GB, which is too small 
 
 `volume_type` selects the storage backend:
 
-- `sbs_volume` (default) - network Block Storage. Works with all current instance ranges. When the instance is terminated, the volume is detached and the orchestrator explicitly deletes it.
+- `sbs_volume` (default) - network Block Storage. Works with all current instance ranges. Terminating an instance only *detaches* a `sbs_volume`, so the orchestrator waits until the instance is fully deleted and the volume reports `available`, then deletes it through the Block Storage API. Deletes are retried, and any volume that still cannot be removed is recorded in `config/state.json` and retried on every poll and at startup.
 - `l_ssd` - local SSD, only available on Development (DEV1) and first-generation General Purpose (GP1) instance types. It is deleted automatically when the instance is terminated.
 
 `volume_iops` selects the Block Storage performance class for `sbs_volume` roots: `5000` (default) or `15000` IOPS. The Instance API cannot set IOPS at creation time, so the orchestrator applies it through the Block Storage API once the instance is created. 15K requires the instance type to expose at least **3 GiB/s of block bandwidth**; otherwise 5000 IOPS is used. The setting is ignored for `l_ssd`.
@@ -166,7 +166,7 @@ If `ssh_public_key` is set, the orchestrator attaches it to the instance using a
 
 Scaleway CPU Instances are billed **per hour while powered on**, with a minimum of 60 minutes per start/stop period. Storage volumes and flexible IPv4 addresses are billed separately and continue while the instance exists.
 
-Because of the 60-minute minimum block, terminating an idle instance at `min_lifetime_minutes = 20` costs the same as waiting until 55 minutes. Setting `min_lifetime_minutes = 60` keeps the instance available for the full paid block to absorb follow-up jobs. The orchestrator terminates the instance and deletes its volumes once no jobs remain and the minimum lifetime has elapsed.
+Because of the 60-minute minimum block, terminating an idle instance at `min_lifetime_minutes = 20` costs the same as waiting until 55 minutes. Setting `min_lifetime_minutes = 60` keeps the instance available for the full paid block to absorb follow-up jobs. The orchestrator terminates the instance and deletes its volumes once no jobs remain and the minimum lifetime has elapsed. Cleanup waits for the termination to complete and for Block Storage volumes to detach before deleting them, retrying failures across poll cycles so no billable volume is leaked.
 
 ## Logs
 
