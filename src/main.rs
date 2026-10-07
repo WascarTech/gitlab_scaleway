@@ -269,6 +269,8 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
                 runner.server_name, runner.server_id
             );
+            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            state.set_pending_volumes(failed);
             warn!("Clearing state...");
             state.clear_runner();
         }
@@ -279,6 +281,8 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
                 runner.server_id, server.id
             );
+            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            state.set_pending_volumes(failed);
             warn!("Updating state with Scaleway data (creation time unknown)...");
             let volume_ids = server_volume_ids(&server);
             state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
