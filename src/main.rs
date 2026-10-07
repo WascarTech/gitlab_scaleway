@@ -269,6 +269,8 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
                 runner.server_name, runner.server_id
             );
+            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            state.set_pending_volumes(failed);
             warn!("Clearing state...");
             state.clear_runner();
         }
@@ -279,6 +281,8 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
                 runner.server_id, server.id
             );
+            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            state.set_pending_volumes(failed);
             warn!("Updating state with Scaleway data (creation time unknown)...");
             let volume_ids = server_volume_ids(&server);
             state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
@@ -304,6 +308,17 @@ async fn verify_state_with_scaleway(
     Ok(())
 }
 
+/// Retries deletion of volumes from previous failed attempts.
+async fn retry_pending_volumes(scaleway_client: &ScalewayClient, state: &mut OrchestratorState) {
+    let pending = state.pending_volume_ids();
+    if pending.is_empty() {
+        return;
+    }
+    info!("Retrying deletion of {} pending volume(s)", pending.len());
+    let failed = scaleway_client.delete_volumes(&pending).await;
+    state.set_pending_volumes(failed);
+}
+
 /// One pass of the orchestration logic.
 async fn orchestration_tick(
     gitlab_client: &GitLabClient,
@@ -313,6 +328,8 @@ async fn orchestration_tick(
     config: &Config,
     state: &mut OrchestratorState,
 ) -> Result<()> {
+    retry_pending_volumes(scaleway_client, state).await;
+
     // Query GitLab for active jobs (filtered by tag if configured)
     let active_jobs = gitlab_client
         .find_active_jobs(config.gitlab.tag_filter.as_deref())
@@ -450,7 +467,10 @@ async fn delete_runner(
         .await
         .context("Error terminating server")?;
 
-    scaleway_client.delete_volumes(&volume_ids).await;
+    let mut to_delete = volume_ids;
+    to_delete.extend(state.pending_volume_ids());
+    let failed = scaleway_client.delete_volumes(&to_delete).await;
+    state.set_pending_volumes(failed);
 
     if let Err(e) = csv_logger.log_stop(&server_id, reason, uptime) {
         warn!("Error in CSV logging: {}", e);
