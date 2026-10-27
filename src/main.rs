@@ -18,6 +18,7 @@ mod cloud_init;
 mod config;
 mod csv_log;
 mod gitlab;
+mod provisioning;
 mod scaleway;
 mod state;
 
@@ -34,8 +35,10 @@ use crate::cloud_init::generate_cloud_init;
 use crate::config::{load_runner_config, Config};
 use crate::csv_log::CsvLogger;
 use crate::gitlab::GitLabClient;
-use crate::scaleway::{server_volume_ids, ScalewayClient};
-use crate::state::{OrchestratorState, RunnerState};
+use crate::scaleway::{
+    server_has_public_ipv4, server_owned_ip_ids, server_volume_ids, ScalewayClient, Server,
+};
+use crate::state::{OrchestratorState, RunnerState, ZonedId};
 
 /// Default path for configuration.
 const CONFIG_PATH: &str = "config/config.toml";
@@ -70,8 +73,12 @@ token = "glpat-xxxxxxxxxxxxxxxxxxxx"
 token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # Scaleway Project ID that owns the runner
 project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-# Availability Zone (fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1)
-zone = "fr-par-1"
+# Availability Zones in priority order. The runner is created in the first
+# zone that can provide a reserved IPv4 address.
+# Valid zones: fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1
+zones = ["fr-par-1", "fr-par-2", "fr-par-3", "pl-waw-1"]
+# The legacy single-zone form is still accepted:
+# zone = "fr-par-1"
 # Instance type (e.g. PLAY2-PICO, DEV1-M, PRO2-XS, PRO2-S)
 server_type = "PRO2-XS"
 # Marketplace image label or local image UUID
@@ -200,7 +207,7 @@ async fn main() -> Result<()> {
         OrchestratorState::with_persistence(STATE_PATH).context("Error loading state")?;
 
     // Verify that saved state matches Scaleway
-    verify_state_with_scaleway(&scaleway_client, &config.runner.name, &mut state).await?;
+    verify_state_with_scaleway(&scaleway_client, &config, &config.runner.name, &mut state).await?;
 
     // Polling interval (Debug: 5s, Release: from config)
     let poll_interval_secs = if is_debug_build() {
@@ -245,22 +252,56 @@ async fn main() -> Result<()> {
 /// - Both say no server → OK
 async fn verify_state_with_scaleway(
     scaleway_client: &ScalewayClient,
+    config: &Config,
     server_name: &str,
     state: &mut OrchestratorState,
 ) -> Result<()> {
     info!("Verifying state with Scaleway API...");
 
-    let scaleway_server = scaleway_client.find_server_by_name(server_name).await?;
+    // A known zone is authoritative even if it is no longer configured. Legacy
+    // state has no zone, so those runners are searched across the priority list.
+    let located = match &state.runner {
+        Some(runner) if !runner.zone.is_empty() => scaleway_client
+            .find_server_by_name(&runner.zone, server_name)
+            .await?
+            .map(|server| (runner.zone.clone(), server)),
+        _ => find_server_across_zones(scaleway_client, &config.scaleway.zones, server_name).await?,
+    };
 
-    match (&state.runner, scaleway_server) {
+    match (&state.runner, located) {
         // State and Scaleway match - server exists
-        (Some(runner), Some(server)) if runner.server_id == server.id => {
+        (Some(runner), Some((zone, server))) if runner.server_id == server.id => {
             info!(
-                "State verified: Server {} (ID: {}) exists, running for {} minutes",
+                "State verified: Server {} (ID: {}) exists in zone {}, running for {} minutes",
                 server.name,
                 server.id,
+                zone,
                 runner.uptime_minutes()
             );
+            let mut updated = runner.clone();
+            if updated.zone != zone {
+                updated.zone = zone.clone();
+            }
+            if updated.ip_ids.is_empty() {
+                updated.ip_ids = server_owned_ip_ids(&server);
+            }
+            if updated.zone != runner.zone || updated.ip_ids != runner.ip_ids {
+                state.set_runner(updated);
+            }
+            ensure_runner_healthy(scaleway_client, state, &zone, &server).await?;
+        }
+
+        // State says server exists, but with a different ID (very unlikely)
+        (Some(runner), Some((zone, server))) => {
+            warn!(
+                "State inconsistency: State knows server ID {}, Scaleway has ID {} in zone {}!",
+                runner.server_id, server.id, zone
+            );
+            let old_runner = runner.clone();
+            cleanup_runner_resources(scaleway_client, state, &old_runner).await;
+            warn!("Updating state with Scaleway data (creation time unknown)...");
+            adopt_server(state, &zone, &server);
+            ensure_runner_healthy(scaleway_client, state, &zone, &server).await?;
         }
 
         // State says server exists, but Scaleway doesn't know it anymore
@@ -269,34 +310,21 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
                 runner.server_name, runner.server_id
             );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
-            state.set_pending_volumes(failed);
+            let old_runner = runner.clone();
+            cleanup_runner_resources(scaleway_client, state, &old_runner).await;
             warn!("Clearing state...");
             state.clear_runner();
         }
 
-        // State says server exists, but with different ID (very unlikely)
-        (Some(runner), Some(server)) => {
-            warn!(
-                "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
-                runner.server_id, server.id
-            );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
-            state.set_pending_volumes(failed);
-            warn!("Updating state with Scaleway data (creation time unknown)...");
-            let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
-        }
-
         // State says no server, but Scaleway has one (emergency recovery)
-        (None, Some(server)) => {
+        (None, Some((zone, server))) => {
             warn!(
-                "Orphaned server found: {} (ID: {}) - not in state!",
-                server.name, server.id
+                "Orphaned server found: {} (ID: {}) in zone {} - not in state!",
+                server.name, server.id, zone
             );
             warn!("Adding to state (creation time unknown)...");
-            let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
+            adopt_server(state, &zone, &server);
+            ensure_runner_healthy(scaleway_client, state, &zone, &server).await?;
         }
 
         // All OK - no server
@@ -308,15 +336,235 @@ async fn verify_state_with_scaleway(
     Ok(())
 }
 
-/// Retries deletion of volumes from previous failed attempts.
-async fn retry_pending_volumes(scaleway_client: &ScalewayClient, state: &mut OrchestratorState) {
-    let pending = state.pending_volume_ids();
-    if pending.is_empty() {
-        return;
+/// Finds a server with the given name in the first zone that has it.
+async fn find_server_across_zones(
+    scaleway_client: &ScalewayClient,
+    zones: &[String],
+    name: &str,
+) -> Result<Option<(String, Server)>> {
+    let mut found: Option<(String, Server)> = None;
+    for zone in zones {
+        if let Some(server) = scaleway_client.find_server_by_name(zone, name).await? {
+            if found.is_some() {
+                warn!(
+                    "Multiple servers named '{}' found; using the highest-priority zone",
+                    name
+                );
+            } else {
+                found = Some((zone.clone(), server));
+            }
+        }
     }
-    info!("Retrying deletion of {} pending volume(s)", pending.len());
-    let failed = scaleway_client.delete_volumes(&pending).await;
+    Ok(found)
+}
+
+/// Finds the zone containing a server ID, or `None` if it is gone.
+async fn find_server_by_id_across_zones(
+    scaleway_client: &ScalewayClient,
+    zones: &[String],
+    server_id: &str,
+) -> Result<Option<String>> {
+    for zone in zones {
+        if scaleway_client.get_server(zone, server_id).await?.is_some() {
+            return Ok(Some(zone.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Records a server found at Scaleway as the active runner.
+fn adopt_server(state: &mut OrchestratorState, zone: &str, server: &Server) {
+    state.set_runner(RunnerState::new(
+        server.id.clone(),
+        server.name.clone(),
+        zone.to_string(),
+        server_volume_ids(server),
+        server_owned_ip_ids(server),
+    ));
+}
+
+/// What to do with a runner found at startup.
+#[derive(Debug, PartialEq, Eq)]
+enum RunnerHealth {
+    Healthy,
+    Replace,
+    LeaveTransient,
+}
+
+/// Classifies a runner's state for the startup health check.
+fn runner_health(state: &str, has_ipv4: bool) -> RunnerHealth {
+    match state {
+        "running" if has_ipv4 => RunnerHealth::Healthy,
+        "running" | "stopped" | "stopped in place" => RunnerHealth::Replace,
+        "starting" | "stopping" | "locked" => RunnerHealth::LeaveTransient,
+        _ => RunnerHealth::LeaveTransient,
+    }
+}
+
+/// Terminates a runner that cannot serve traffic and clears its state.
+async fn ensure_runner_healthy(
+    scaleway_client: &ScalewayClient,
+    state: &mut OrchestratorState,
+    zone: &str,
+    server: &Server,
+) -> Result<()> {
+    let has_ipv4 = server_has_public_ipv4(server);
+    match runner_health(&server.state, has_ipv4) {
+        RunnerHealth::Healthy => return Ok(()),
+        RunnerHealth::LeaveTransient => {
+            warn!(
+                "Runner {} in zone {} is {} - leaving it alone",
+                server.id, zone, server.state
+            );
+            return Ok(());
+        }
+        RunnerHealth::Replace => {}
+    }
+
+    warn!(
+        "Runner {} in zone {} is unusable (state: {}, public IPv4: {}) - replacing it",
+        server.id, zone, server.state, has_ipv4
+    );
+
+    if let Err(e) = scaleway_client.terminate_server(zone, &server.id).await {
+        error!(
+            "Could not terminate unhealthy runner {} in zone {}: {}",
+            server.id, zone, e
+        );
+        // Keep the state so a later run can retry instead of leaking the server.
+        return Ok(());
+    }
+
+    let volumes = cleanup_volumes(
+        zone,
+        &server_volume_ids(server),
+        state.runner.as_ref(),
+        state.pending_volumes(),
+    );
+    let failed = scaleway_client.delete_volumes(&volumes).await;
     state.set_pending_volumes(failed);
+
+    let ips = cleanup_ips(
+        zone,
+        &server_owned_ip_ids(server),
+        state.runner.as_ref(),
+        state.pending_ips(),
+    );
+    let failed = scaleway_client.delete_ips(&ips).await;
+    state.set_pending_ips(failed);
+
+    state.clear_runner();
+    Ok(())
+}
+
+/// Deletes a runner's recorded volumes and reserved IPs without terminating it.
+async fn cleanup_runner_resources(
+    scaleway_client: &ScalewayClient,
+    state: &mut OrchestratorState,
+    runner: &RunnerState,
+) {
+    let volumes = cleanup_volumes("", &[], Some(runner), state.pending_volumes());
+    if !volumes.is_empty() {
+        let failed = scaleway_client.delete_volumes(&volumes).await;
+        state.set_pending_volumes(failed);
+    }
+
+    let ips = cleanup_ips("", &[], Some(runner), state.pending_ips());
+    if !ips.is_empty() {
+        let failed = scaleway_client.delete_ips(&ips).await;
+        state.set_pending_ips(failed);
+    }
+}
+
+/// Builds zoned IDs from a runner zone and resource IDs.
+fn zoned_ids(zone: &str, ids: &[String]) -> Vec<ZonedId> {
+    let zone = if zone.is_empty() {
+        None
+    } else {
+        Some(zone.to_string())
+    };
+    ids.iter()
+        .cloned()
+        .map(|id| ZonedId {
+            zone: zone.clone(),
+            id,
+        })
+        .collect()
+}
+
+/// Appends resources not already present, de-duplicating by ID.
+fn merge_zoned_ids(mut base: Vec<ZonedId>, extra: Vec<ZonedId>) -> Vec<ZonedId> {
+    for item in extra {
+        if !base.iter().any(|existing| existing.id == item.id) {
+            base.push(item);
+        }
+    }
+    base
+}
+
+/// Builds the volume deletion set for replacing or forgetting a runner.
+///
+/// Existing pending entries are preserved so a cleanup triggered by another
+/// runner cannot erase resources that are still awaiting deletion.
+fn cleanup_volumes(
+    zone: &str,
+    server_volumes: &[String],
+    runner: Option<&RunnerState>,
+    pending: Vec<ZonedId>,
+) -> Vec<ZonedId> {
+    let mut volumes = merge_zoned_ids(pending, zoned_ids(zone, server_volumes));
+    if let Some(runner) = runner {
+        volumes = merge_zoned_ids(volumes, zoned_ids(&runner.zone, &runner.volume_ids));
+    }
+    volumes
+}
+
+/// Builds the reserved-IP deletion set for replacing or forgetting a runner.
+fn cleanup_ips(
+    zone: &str,
+    server_ips: &[String],
+    runner: Option<&RunnerState>,
+    pending: Vec<ZonedId>,
+) -> Vec<ZonedId> {
+    let mut ips = merge_zoned_ids(pending, zoned_ids(zone, server_ips));
+    if let Some(runner) = runner {
+        ips = merge_zoned_ids(ips, zoned_ids(&runner.zone, &runner.ip_ids));
+    }
+    ips
+}
+
+/// Picks the zone used to terminate a runner.
+///
+/// A concrete recorded zone wins when the server is actually there. If it is
+/// not, the zone where the server was found is used; `None` means the server
+/// could not be located and termination must be skipped.
+fn choose_delete_zone(
+    recorded_zone: &str,
+    exists_in_recorded_zone: bool,
+    found_elsewhere: Option<String>,
+) -> Option<String> {
+    if !recorded_zone.is_empty() && exists_in_recorded_zone {
+        Some(recorded_zone.to_string())
+    } else {
+        found_elsewhere
+    }
+}
+
+/// Retries deletion of resources from previous failed attempts.
+async fn retry_pending_resources(scaleway_client: &ScalewayClient, state: &mut OrchestratorState) {
+    let volumes = state.pending_volumes();
+    if !volumes.is_empty() {
+        info!("Retrying deletion of {} pending volume(s)", volumes.len());
+        let failed = scaleway_client.delete_volumes(&volumes).await;
+        state.set_pending_volumes(failed);
+    }
+
+    let ips = state.pending_ips();
+    if !ips.is_empty() {
+        info!("Retrying release of {} pending IP(s)", ips.len());
+        let failed = scaleway_client.delete_ips(&ips).await;
+        state.set_pending_ips(failed);
+    }
 }
 
 /// One pass of the orchestration logic.
@@ -328,7 +576,7 @@ async fn orchestration_tick(
     config: &Config,
     state: &mut OrchestratorState,
 ) -> Result<()> {
-    retry_pending_volumes(scaleway_client, state).await;
+    retry_pending_resources(scaleway_client, state).await;
 
     // Query GitLab for active jobs (filtered by tag if configured)
     let active_jobs = gitlab_client
@@ -391,20 +639,39 @@ async fn create_runner(
 ) -> Result<()> {
     info!("Creating new runner server...");
 
-    let server = scaleway_client
-        .create_server(&config.runner.name, cloud_init)
-        .await
-        .context("Error creating server")?;
+    let provisioned = crate::provisioning::create_with_fallback(
+        scaleway_client,
+        &config.scaleway,
+        &config.runner.name,
+        cloud_init,
+        state,
+    )
+    .await
+    .context("Error creating server")?;
 
-    let volume_ids = server_volume_ids(&server);
-    let runner_state = RunnerState::new(server.id.clone(), server.name.clone(), volume_ids);
+    let volume_ids = server_volume_ids(&provisioned.server);
+    let runner_state = RunnerState::new(
+        provisioned.server.id.clone(),
+        provisioned.server.name.clone(),
+        provisioned.zone.clone(),
+        volume_ids,
+        provisioned.ip_ids.clone(),
+    );
     state.set_runner(runner_state);
 
-    if let Err(e) = csv_logger.log_start(&server.id, project, pipeline_id, "pipeline_pending") {
+    if let Err(e) = csv_logger.log_start(
+        &provisioned.server.id,
+        project,
+        pipeline_id,
+        "pipeline_pending",
+    ) {
         warn!("Error in CSV logging: {}", e);
     }
 
-    info!("Runner server created and ready");
+    info!(
+        "Runner server created and ready in zone {}",
+        provisioned.zone
+    );
     Ok(())
 }
 
@@ -441,13 +708,14 @@ async fn maybe_delete_runner(
         "all_pipelines_done"
     };
 
-    delete_runner(scaleway_client, csv_logger, state, reason).await
+    delete_runner(scaleway_client, csv_logger, config, state, reason).await
 }
 
-/// Terminates the runner server and removes its volumes.
+/// Terminates the runner server and removes its volumes and reserved IPs.
 async fn delete_runner(
     scaleway_client: &ScalewayClient,
     csv_logger: &CsvLogger,
+    config: &Config,
     state: &mut OrchestratorState,
     reason: &str,
 ) -> Result<()> {
@@ -458,19 +726,52 @@ async fn delete_runner(
 
     let server_id = runner.server_id.clone();
     let volume_ids = runner.volume_ids.clone();
+    let ip_ids = runner.ip_ids.clone();
+    let recorded_zone = runner.zone.clone();
     let uptime = runner.uptime_minutes();
 
-    info!("Deleting runner server (reason: {})", reason);
+    let exists_in_recorded_zone = if recorded_zone.is_empty() {
+        false
+    } else {
+        scaleway_client
+            .get_server(&recorded_zone, &server_id)
+            .await?
+            .is_some()
+    };
+    let found_elsewhere = if exists_in_recorded_zone {
+        None
+    } else {
+        find_server_by_id_across_zones(scaleway_client, &config.scaleway.zones, &server_id).await?
+    };
+    let delete_zone = choose_delete_zone(&recorded_zone, exists_in_recorded_zone, found_elsewhere);
 
-    scaleway_client
-        .terminate_server(&server_id)
-        .await
-        .context("Error terminating server")?;
+    if let Some(ref zone) = delete_zone {
+        info!(
+            "Deleting runner server in zone {} (reason: {})",
+            zone, reason
+        );
+        scaleway_client
+            .terminate_server(zone, &server_id)
+            .await
+            .context("Error terminating server")?;
+    } else {
+        warn!(
+            "Server {} was not found in its recorded zone or any configured zone; \
+             skipping termination and cleaning up recorded resources",
+            server_id
+        );
+    }
 
-    let mut to_delete = volume_ids;
-    to_delete.extend(state.pending_volume_ids());
+    let resource_zone = delete_zone.as_deref().unwrap_or_default();
+    let mut to_delete: Vec<ZonedId> = zoned_ids(resource_zone, &volume_ids);
+    to_delete.extend(state.pending_volumes());
     let failed = scaleway_client.delete_volumes(&to_delete).await;
     state.set_pending_volumes(failed);
+
+    let mut ips_to_delete: Vec<ZonedId> = zoned_ids(resource_zone, &ip_ids);
+    ips_to_delete.extend(state.pending_ips());
+    let failed = scaleway_client.delete_ips(&ips_to_delete).await;
+    state.set_pending_ips(failed);
 
     if let Err(e) = csv_logger.log_stop(&server_id, reason, uptime) {
         warn!("Error in CSV logging: {}", e);
@@ -501,5 +802,146 @@ mod tests {
     fn test_should_terminate_at_or_after_min_lifetime() {
         assert!(should_terminate(20, 20, false));
         assert!(should_terminate(65, 20, false));
+    }
+
+    #[test]
+    fn test_runner_health() {
+        assert_eq!(runner_health("running", true), RunnerHealth::Healthy);
+        assert_eq!(runner_health("running", false), RunnerHealth::Replace);
+        assert_eq!(runner_health("stopped", true), RunnerHealth::Replace);
+        assert_eq!(
+            runner_health("stopped in place", true),
+            RunnerHealth::Replace
+        );
+        assert_eq!(
+            runner_health("starting", false),
+            RunnerHealth::LeaveTransient
+        );
+        assert_eq!(
+            runner_health("stopping", false),
+            RunnerHealth::LeaveTransient
+        );
+        assert_eq!(runner_health("locked", false), RunnerHealth::LeaveTransient);
+        assert_eq!(
+            runner_health("unexpected", true),
+            RunnerHealth::LeaveTransient
+        );
+    }
+
+    #[test]
+    fn test_zoned_ids_keep_unknown_zone() {
+        assert_eq!(
+            zoned_ids("", &["vol-1".to_string()]),
+            vec![ZonedId {
+                zone: None,
+                id: "vol-1".to_string()
+            }]
+        );
+        assert_eq!(
+            zoned_ids("fr-par-2", &["vol-1".to_string()]),
+            vec![ZonedId {
+                zone: Some("fr-par-2".to_string()),
+                id: "vol-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_cleanup_volumes_keeps_preexisting_pending_entries() {
+        let pending = vec![ZonedId {
+            zone: Some("pl-waw-1".to_string()),
+            id: "vol-old".to_string(),
+        }];
+        let runner = RunnerState::new(
+            "srv-1".to_string(),
+            "runner".to_string(),
+            "fr-par-1".to_string(),
+            vec!["vol-current".to_string()],
+            vec![],
+        );
+        let volumes = cleanup_volumes(
+            "fr-par-1",
+            &["vol-current".to_string()],
+            Some(&runner),
+            pending,
+        );
+
+        assert_eq!(volumes.len(), 2);
+        assert!(volumes.iter().any(|volume| volume.id == "vol-old"));
+        assert!(volumes.iter().any(|volume| volume.id == "vol-current"));
+    }
+
+    #[test]
+    fn test_cleanup_ips_keeps_preexisting_pending_entries() {
+        let pending = vec![ZonedId {
+            zone: Some("pl-waw-1".to_string()),
+            id: "ip-old".to_string(),
+        }];
+        let runner = RunnerState::new(
+            "srv-1".to_string(),
+            "runner".to_string(),
+            "fr-par-1".to_string(),
+            vec![],
+            vec!["ip-current".to_string()],
+        );
+        let ips = cleanup_ips(
+            "fr-par-1",
+            &["ip-current".to_string()],
+            Some(&runner),
+            pending,
+        );
+
+        assert_eq!(ips.len(), 2);
+        assert!(ips.iter().any(|ip| ip.id == "ip-old"));
+        assert!(ips.iter().any(|ip| ip.id == "ip-current"));
+    }
+
+    #[test]
+    fn test_choose_delete_zone() {
+        assert_eq!(
+            choose_delete_zone("fr-par-1", true, None),
+            Some("fr-par-1".to_string())
+        );
+        assert_eq!(
+            choose_delete_zone("fr-par-1", false, Some("fr-par-2".to_string())),
+            Some("fr-par-2".to_string())
+        );
+        assert_eq!(
+            choose_delete_zone("", false, Some("fr-par-3".to_string())),
+            Some("fr-par-3".to_string())
+        );
+        assert_eq!(choose_delete_zone("", false, None), None);
+        assert_eq!(choose_delete_zone("fr-par-1", false, None), None);
+    }
+
+    #[test]
+    fn test_merge_zoned_ids_dedupes_by_id() {
+        let base = vec![ZonedId {
+            zone: Some("fr-par-1".to_string()),
+            id: "vol-1".to_string(),
+        }];
+        let extra = vec![
+            ZonedId {
+                zone: Some("fr-par-2".to_string()),
+                id: "vol-1".to_string(),
+            },
+            ZonedId {
+                zone: None,
+                id: "vol-2".to_string(),
+            },
+        ];
+        assert_eq!(
+            merge_zoned_ids(base, extra),
+            vec![
+                ZonedId {
+                    zone: Some("fr-par-1".to_string()),
+                    id: "vol-1".to_string()
+                },
+                ZonedId {
+                    zone: None,
+                    id: "vol-2".to_string()
+                }
+            ]
+        );
     }
 }
