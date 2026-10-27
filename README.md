@@ -5,6 +5,7 @@ Automatic provisioning of Scaleway Instances as GitLab CI runners - **pay only w
 ## Features
 
 - **Automatic server creation** when pipelines are pending/running
+- **Zone fallback** - tries a priority list of Scaleway zones and reserves an IPv4 before creating an instance
 - **Cost-aware deletion** - the instance is terminated once the minimum lifetime has elapsed and no jobs remain
 - **Configurable root volume** - sized for Docker layer and build caches (default 50 GB)
 - **Polls all projects** - one runner for the entire GitLab instance
@@ -21,7 +22,9 @@ flowchart TB
         Poll --> FetchProjects[GitLab: Fetch all projects]
         FetchProjects --> CheckPipelines[Per project: Pending/Running pipelines?]
         CheckPipelines -->|Yes + No server| LogStart[CSV: Log reason]
-        LogStart --> CreateServer[Scaleway: Create stopped instance]
+        LogStart --> ReserveIP[Scaleway: Reserve IPv4 in next zone]
+        ReserveIP -->|Zone unavailable| ReserveIP
+        ReserveIP --> CreateServer[Scaleway: Create stopped instance]
         CreateServer --> CloudInit[Scaleway: Apply cloud-init]
         CloudInit --> PowerOn[Scaleway: Power on]
         CheckPipelines -->|No everywhere + Server exists| CheckDelete[Check min lifetime]
@@ -115,7 +118,12 @@ token = "glpat-xxxxxxxxxxxxxxxxxxxx"  # read_api scope
 [scaleway]
 token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # IAM API secret key
 project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-zone = "fr-par-1"                # fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1
+# Availability Zones in priority order. The runner is created in the first
+# zone that can provide a reserved IPv4 address.
+# Valid zones: fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1
+zones = ["fr-par-1", "fr-par-2", "fr-par-3", "pl-waw-1"]
+# The legacy single-zone form is still accepted:
+# zone = "fr-par-1"
 server_type = "PRO2-XS"
 image = "ubuntu_noble"
 ssh_public_key = "ssh-ed25519 AAAA... user@host"  # optional
@@ -132,6 +140,22 @@ run_untagged = true
 # Whether the runner should only run jobs on protected branches
 protected = false
 ```
+
+### Zone fallback
+
+`zones` is a priority list. For each provisioning attempt the orchestrator:
+
+1. reserves a flexible IPv4 in the zone;
+2. creates the instance with that IP attached (`dynamic_ip_required = false`);
+3. waits for it to boot and confirms that an IPv4 address is present.
+
+A zone that cannot reserve an address (pool exhausted, quota, capacity) is skipped without creating an instance. If a later step fails, the attempt is terminated and its volumes and IP are released before the next zone is tried. If the server itself cannot be terminated, it is recorded in state and the fallback stops, so no untracked instance is left behind. When every zone fails, the error is logged and the next poll tries again.
+
+Reserved IPs are owned by the orchestrator: they are recorded in `config/state.json` and released after the runner is terminated. Failed releases are kept in the pending cleanup list and retried on every poll. The `gitlab-runner` tag identifies these IPs.
+
+The state file records the zone each runner was created in, so deletion always targets the right region. Upgrading from a single-zone state file is automatic: the orchestrator searches the configured zones for the recorded server on first start. **Keep the previous zone in `zones` for that first run**, otherwise the old server cannot be found.
+
+Marketplace image labels such as `ubuntu_noble` work in every zone. A local image UUID only exists in one zone, so it defeats the fallback; use a label if you want the full list to be usable.
 
 ### Runner Options
 
@@ -164,9 +188,9 @@ If `ssh_public_key` is set, the orchestrator attaches it to the instance using a
 
 ## Billing
 
-Scaleway CPU Instances are billed **per hour while powered on**, with a minimum of 60 minutes per start/stop period. Storage volumes and flexible IPv4 addresses are billed separately and continue while the instance exists.
+Scaleway CPU Instances are billed **per hour while powered on**, with a minimum of 60 minutes per start/stop period. Storage volumes and reserved IPv4 addresses are billed separately. The orchestrator owns both: it releases the reserved IP and deletes the volumes when the runner is terminated, retrying failures across poll cycles so no billable resource is leaked.
 
-Because of the 60-minute minimum block, terminating an idle instance at `min_lifetime_minutes = 20` costs the same as waiting until 55 minutes. Setting `min_lifetime_minutes = 60` keeps the instance available for the full paid block to absorb follow-up jobs. The orchestrator terminates the instance and deletes its volumes once no jobs remain and the minimum lifetime has elapsed. Cleanup waits for the termination to complete and for Block Storage volumes to detach before deleting them, retrying failures across poll cycles so no billable volume is leaked.
+Because of the 60-minute minimum block, terminating an idle instance at `min_lifetime_minutes = 20` costs the same as waiting until 55 minutes. Setting `min_lifetime_minutes = 60` keeps the instance available for the full paid block to absorb follow-up jobs. The orchestrator terminates the instance once no jobs remain and the minimum lifetime has elapsed. Cleanup waits for the termination to complete and for Block Storage volumes to detach before deleting them.
 
 ## Logs
 
@@ -186,3 +210,7 @@ timestamp,event,server_id,project,pipeline_id,reason,duration_minutes
 - Rewrite `config/config.toml`: replace the `[hetzner]` section with `[scaleway]` (see above).
 - Delete any existing `config/state.json`. The old numeric server ID is not compatible; the orchestrator ignores an unreadable state file and starts fresh.
 - `config/runner.toml` is unchanged.
+
+## Upgrading from a single-zone setup
+
+A `zone = "..."` configuration keeps working as a one-element list. If you switch to `zones`, keep the previous zone in the list for the first run: `state.json` from older versions has no recorded zone, so the existing runner is found by searching the configured zones. Once found, its zone is saved and later restarts use it directly. Old pending volume IDs are migrated automatically and retried in every configured zone.

@@ -73,8 +73,12 @@ token = "glpat-xxxxxxxxxxxxxxxxxxxx"
 token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # Scaleway Project ID that owns the runner
 project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-# Availability Zone (fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1)
-zone = "fr-par-1"
+# Availability Zones in priority order. The runner is created in the first
+# zone that can provide a reserved IPv4 address.
+# Valid zones: fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1
+zones = ["fr-par-1", "fr-par-2", "fr-par-3", "pl-waw-1"]
+# The legacy single-zone form is still accepted:
+# zone = "fr-par-1"
 # Instance type (e.g. PLAY2-PICO, DEV1-M, PRO2-XS, PRO2-S)
 server_type = "PRO2-XS"
 # Marketplace image label or local image UUID
