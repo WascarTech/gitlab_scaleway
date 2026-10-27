@@ -283,7 +283,7 @@ impl ScalewayClient {
     /// Creates a new Scaleway client.
     pub fn new(config: &ScalewayConfig) -> Self {
         info!("Scaleway client initialized");
-        info!("  Zone: {}", config.zone);
+        info!("  Zones (priority): {}", config.zones.join(", "));
         info!("  Server type: {}", config.server_type);
         info!("  Image: {}", config.image);
         info!(
@@ -304,7 +304,9 @@ impl ScalewayClient {
     fn zone_url(&self, path: &str) -> String {
         format!(
             "{}/instance/v1/zones/{}{}",
-            SCALEWAY_API_URL, self.config.zone, path
+            SCALEWAY_API_URL,
+            self.config.primary_zone(),
+            path
         )
     }
 
@@ -534,7 +536,9 @@ impl ScalewayClient {
     async fn update_volume_iops(&self, volume_id: &str, iops: u32) -> Result<(), ScalewayError> {
         let url = format!(
             "{}/block/v1/zones/{}/volumes/{}",
-            SCALEWAY_API_URL, self.config.zone, volume_id
+            SCALEWAY_API_URL,
+            self.config.primary_zone(),
+            volume_id
         );
         self.patch_json(&url, &UpdateVolumeIopsRequest { perf_iops: iops })
             .await
@@ -614,7 +618,9 @@ impl ScalewayClient {
     ) -> Result<Option<BlockVolumeGetResponse>, ScalewayError> {
         let url = format!(
             "{}/block/v1/zones/{}/volumes/{}",
-            SCALEWAY_API_URL, self.config.zone, volume_id
+            SCALEWAY_API_URL,
+            self.config.primary_zone(),
+            volume_id
         );
         match self.get_url::<BlockVolumeGetResponse>(&url).await {
             Ok(volume) => Ok(Some(volume)),
@@ -642,7 +648,9 @@ impl ScalewayClient {
         for attempt in 1..=VOLUME_DELETE_ATTEMPTS {
             let url = format!(
                 "{}/block/v1/zones/{}/volumes/{}",
-                SCALEWAY_API_URL, self.config.zone, volume_id
+                SCALEWAY_API_URL,
+                self.config.primary_zone(),
+                volume_id
             );
             match self.delete_url(&url).await {
                 Ok(()) => {
@@ -776,7 +784,7 @@ mod tests {
         let config = ScalewayConfig {
             token: "t".to_string(),
             project_id: "p".to_string(),
-            zone: "fr-par-1".to_string(),
+            zones: vec!["fr-par-1".to_string()],
             server_type: "PRO2-XS".to_string(),
             image: "ubuntu_noble".to_string(),
             ssh_public_key: Some("ssh-ed25519 AAAA key".to_string()),
@@ -801,7 +809,7 @@ mod tests {
         let config = ScalewayConfig {
             token: "t".to_string(),
             project_id: "p".to_string(),
-            zone: "fr-par-1".to_string(),
+            zones: vec!["fr-par-1".to_string()],
             server_type: "PRO2-XS".to_string(),
             image: "ubuntu_noble".to_string(),
             ssh_public_key: None,
