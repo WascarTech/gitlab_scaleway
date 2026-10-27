@@ -303,6 +303,22 @@ pub fn classify_creation_failure(error: &ScalewayError) -> CreationFailure {
     }
 }
 
+/// Returns true when a failed create request may have succeeded anyway.
+///
+/// Transport errors, unparseable responses and gateway/server errors leave the
+/// client unable to tell whether the resource was created.
+pub fn creation_outcome_unknown(error: &ScalewayError) -> bool {
+    matches!(
+        error,
+        ScalewayError::Request(_)
+            | ScalewayError::Parse(_)
+            | ScalewayError::Api {
+                status: 408 | 500 | 502 | 503 | 504,
+                ..
+            }
+    )
+}
+
 /// Builds the request that reserves a flexible IPv4 in a zone.
 fn build_create_ip_request(config: &ScalewayConfig) -> CreateIpRequest {
     CreateIpRequest {
@@ -1011,6 +1027,40 @@ mod tests {
             classify_creation_failure(&ScalewayError::InvalidConfig("bad".to_string())),
             CreationFailure::Abort
         );
+    }
+
+    #[test]
+    fn test_creation_outcome_unknown() {
+        for status in [408, 500, 502, 503, 504] {
+            let error = ScalewayError::Api {
+                status,
+                message: "gateway error".to_string(),
+            };
+            assert!(
+                creation_outcome_unknown(&error),
+                "status {} should be ambiguous",
+                status
+            );
+        }
+
+        for status in [400, 401, 403, 404, 409, 429] {
+            let error = ScalewayError::Api {
+                status,
+                message: "rejected".to_string(),
+            };
+            assert!(
+                !creation_outcome_unknown(&error),
+                "status {} should be definitive",
+                status
+            );
+        }
+
+        assert!(creation_outcome_unknown(&ScalewayError::Parse(
+            "bad json".to_string()
+        )));
+        assert!(!creation_outcome_unknown(&ScalewayError::InvalidConfig(
+            "bad".to_string()
+        )));
     }
 
     #[test]

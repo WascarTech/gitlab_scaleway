@@ -119,16 +119,6 @@ where
     Ok(normalize_zones(raw))
 }
 
-impl ScalewayConfig {
-    /// Returns the highest-priority zone, or an empty string when unset.
-    ///
-    /// Configuration loading rejects an empty list, so runtime callers can
-    /// rely on this being a real zone.
-    pub fn primary_zone(&self) -> &str {
-        self.zones.first().map(String::as_str).unwrap_or_default()
-    }
-}
-
 /// Default root volume size: 50 GB.
 pub fn default_volume_size() -> u32 {
     50
@@ -256,6 +246,11 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_zones_empty() {
+        assert!(normalize_zones(vec![]).is_empty());
+    }
+
+    #[test]
     fn test_validate_zones_rejects_empty() {
         assert!(validate_zones(&[]).is_err());
     }
@@ -291,7 +286,6 @@ image = "ubuntu_noble"
                 "pl-waw-1".to_string()
             ]
         );
-        assert_eq!(config.primary_zone(), "fr-par-1");
     }
 
     #[test]

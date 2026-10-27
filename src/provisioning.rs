@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 
 use crate::config::ScalewayConfig;
 use crate::scaleway::{
-    classify_creation_failure, server_has_public_ipv4, server_volume_ids, CreationFailure,
-    ScalewayClient, ScalewayError, Server,
+    classify_creation_failure, creation_outcome_unknown, server_has_public_ipv4, server_volume_ids,
+    CreationFailure, ScalewayClient, ScalewayError, Server,
 };
 use crate::state::{OrchestratorState, RunnerState, ZonedId};
 
@@ -80,6 +80,23 @@ async fn try_zone(
     cloud_init: &str,
     state: &mut OrchestratorState,
 ) -> Result<ProvisionedRunner, AttemptError> {
+    // Never create a second server while one with the configured name already
+    // exists in this zone. This catches a server left by an earlier ambiguous
+    // create request before it can become a duplicate.
+    match client.find_server_by_name(zone, runner_name).await {
+        Ok(Some(existing)) => {
+            return Err(AttemptError::Abort(anyhow::anyhow!(
+                "A server named '{}' already exists in zone {} (ID: {}); \
+                 refusing to create a duplicate",
+                runner_name,
+                zone,
+                existing.id
+            )));
+        }
+        Ok(None) => {}
+        Err(e) => return Err(AttemptError::Abort(anyhow::Error::new(e))),
+    }
+
     // Reserve the address first: this fails cheaply in a zone without IPv4.
     let ip = match client.create_ip(zone).await {
         Ok(ip) => ip,
@@ -92,6 +109,42 @@ async fn try_zone(
     {
         Ok(server) => server,
         Err(e) => {
+            // A transport error or a 5xx may still mean the server was created.
+            // Re-query before releasing the IP and deciding to move on.
+            if creation_outcome_unknown(&e) {
+                match client.find_server_by_name(zone, runner_name).await {
+                    Ok(Some(existing)) => {
+                        warn!(
+                            "Server creation in zone {} reported an error but a server exists; \
+                             cleaning it up: {}",
+                            zone, e
+                        );
+                        return Err(handle_failed_attempt(
+                            client,
+                            state,
+                            zone,
+                            &existing,
+                            &ip.id,
+                            &format!("creation reported an error but the server exists: {}", e),
+                        )
+                        .await);
+                    }
+                    Ok(None) => {}
+                    Err(lookup_error) => {
+                        state.add_pending_ips(vec![ZonedId {
+                            zone: Some(zone.to_string()),
+                            id: ip.id.clone(),
+                        }]);
+                        return Err(AttemptError::Abort(anyhow::anyhow!(
+                            "Create server in zone {} failed ({}) and the existence check also \
+                             failed ({}); not starting another server",
+                            zone,
+                            e,
+                            lookup_error
+                        )));
+                    }
+                }
+            }
             release_ip(client, state, zone, &ip.id).await;
             return Err(classify_failure(e));
         }
