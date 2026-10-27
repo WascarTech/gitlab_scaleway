@@ -35,7 +35,7 @@ use crate::config::{load_runner_config, Config};
 use crate::csv_log::CsvLogger;
 use crate::gitlab::GitLabClient;
 use crate::scaleway::{server_volume_ids, ScalewayClient};
-use crate::state::{OrchestratorState, RunnerState};
+use crate::state::{OrchestratorState, RunnerState, ZonedId};
 
 /// Default path for configuration.
 const CONFIG_PATH: &str = "config/config.toml";
@@ -269,7 +269,8 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
                 runner.server_name, runner.server_id
             );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            let volumes = zoned_volumes(runner);
+            let failed = delete_zoned_volumes(scaleway_client, &volumes).await;
             state.set_pending_volumes(failed);
             warn!("Clearing state...");
             state.clear_runner();
@@ -281,11 +282,18 @@ async fn verify_state_with_scaleway(
                 "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
                 runner.server_id, server.id
             );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
+            let volumes = zoned_volumes(runner);
+            let failed = delete_zoned_volumes(scaleway_client, &volumes).await;
             state.set_pending_volumes(failed);
             warn!("Updating state with Scaleway data (creation time unknown)...");
             let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
+            state.set_runner(RunnerState::new(
+                server.id,
+                server.name,
+                String::new(),
+                volume_ids,
+                Vec::new(),
+            ));
         }
 
         // State says no server, but Scaleway has one (emergency recovery)
@@ -296,7 +304,13 @@ async fn verify_state_with_scaleway(
             );
             warn!("Adding to state (creation time unknown)...");
             let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
+            state.set_runner(RunnerState::new(
+                server.id,
+                server.name,
+                String::new(),
+                volume_ids,
+                Vec::new(),
+            ));
         }
 
         // All OK - no server
@@ -308,14 +322,48 @@ async fn verify_state_with_scaleway(
     Ok(())
 }
 
+/// Builds zoned IDs from a runner's recorded volumes.
+fn zoned_volumes(runner: &RunnerState) -> Vec<ZonedId> {
+    let zone = if runner.zone.is_empty() {
+        None
+    } else {
+        Some(runner.zone.clone())
+    };
+    runner
+        .volume_ids
+        .iter()
+        .cloned()
+        .map(|id| ZonedId {
+            zone: zone.clone(),
+            id,
+        })
+        .collect()
+}
+
+/// Deletes zoned volumes and returns only the entries that failed.
+///
+/// TEMPORARY shim until `ScalewayClient::delete_volumes` accepts `ZonedId`.
+async fn delete_zoned_volumes(
+    scaleway_client: &ScalewayClient,
+    volumes: &[ZonedId],
+) -> Vec<ZonedId> {
+    let ids: Vec<String> = volumes.iter().map(|volume| volume.id.clone()).collect();
+    let failed_ids = scaleway_client.delete_volumes(&ids).await;
+    volumes
+        .iter()
+        .filter(|volume| failed_ids.contains(&volume.id))
+        .cloned()
+        .collect()
+}
+
 /// Retries deletion of volumes from previous failed attempts.
 async fn retry_pending_volumes(scaleway_client: &ScalewayClient, state: &mut OrchestratorState) {
-    let pending = state.pending_volume_ids();
+    let pending = state.pending_volumes();
     if pending.is_empty() {
         return;
     }
     info!("Retrying deletion of {} pending volume(s)", pending.len());
-    let failed = scaleway_client.delete_volumes(&pending).await;
+    let failed = delete_zoned_volumes(scaleway_client, &pending).await;
     state.set_pending_volumes(failed);
 }
 
@@ -397,7 +445,13 @@ async fn create_runner(
         .context("Error creating server")?;
 
     let volume_ids = server_volume_ids(&server);
-    let runner_state = RunnerState::new(server.id.clone(), server.name.clone(), volume_ids);
+    let runner_state = RunnerState::new(
+        server.id.clone(),
+        server.name.clone(),
+        config.scaleway.primary_zone().to_string(),
+        volume_ids,
+        Vec::new(),
+    );
     state.set_runner(runner_state);
 
     if let Err(e) = csv_logger.log_start(&server.id, project, pipeline_id, "pipeline_pending") {
@@ -458,6 +512,7 @@ async fn delete_runner(
 
     let server_id = runner.server_id.clone();
     let volume_ids = runner.volume_ids.clone();
+    let zone = runner.zone.clone();
     let uptime = runner.uptime_minutes();
 
     info!("Deleting runner server (reason: {})", reason);
@@ -467,9 +522,19 @@ async fn delete_runner(
         .await
         .context("Error terminating server")?;
 
-    let mut to_delete = volume_ids;
-    to_delete.extend(state.pending_volume_ids());
-    let failed = scaleway_client.delete_volumes(&to_delete).await;
+    let mut to_delete: Vec<ZonedId> = volume_ids
+        .into_iter()
+        .map(|id| ZonedId {
+            zone: if zone.is_empty() {
+                None
+            } else {
+                Some(zone.clone())
+            },
+            id,
+        })
+        .collect();
+    to_delete.extend(state.pending_volumes());
+    let failed = delete_zoned_volumes(scaleway_client, &to_delete).await;
     state.set_pending_volumes(failed);
 
     if let Err(e) = csv_logger.log_stop(&server_id, reason, uptime) {
