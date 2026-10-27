@@ -252,20 +252,37 @@ impl OrchestratorState {
         }
     }
 
+    /// Adds volumes to the pending cleanup list.
+    pub fn add_pending_volumes(&mut self, volumes: Vec<ZonedId>) {
+        if volumes.is_empty() {
+            return;
+        }
+        let mut all = self.pending_volumes.clone();
+        all.extend(volumes);
+        self.set_pending_volumes(all);
+    }
+
     /// Returns a copy of the reserved IPs still awaiting release.
-    // Used once reserved-IP cleanup is wired into the main loop.
-    #[allow(dead_code)]
     pub fn pending_ips(&self) -> Vec<ZonedId> {
         self.pending_ips.clone()
     }
 
     /// Replaces the pending IP list, de-duplicating and persisting it.
-    #[allow(dead_code)]
     pub fn set_pending_ips(&mut self, ips: Vec<ZonedId>) {
         self.pending_ips = dedupe_resources(ips);
         if let Err(e) = self.save_to_file() {
             warn!("Error saving state: {}", e);
         }
+    }
+
+    /// Adds reserved IPs to the pending cleanup list.
+    pub fn add_pending_ips(&mut self, ips: Vec<ZonedId>) {
+        if ips.is_empty() {
+            return;
+        }
+        let mut all = self.pending_ips.clone();
+        all.extend(ips);
+        self.set_pending_ips(all);
     }
 
     /// Checks if a runner is active.

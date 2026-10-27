@@ -13,6 +13,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::config::ScalewayConfig;
+use crate::state::ZonedId;
 
 /// Scaleway API base URL.
 const SCALEWAY_API_URL: &str = "https://api.scaleway.com";
@@ -80,11 +81,51 @@ pub struct Server {
     pub volumes: HashMap<String, Volume>,
 }
 
+/// How a failed creation attempt should be treated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreationFailure {
+    /// This zone cannot provide the runner; try the next one.
+    NextZone,
+    /// The failure is not zone-specific (auth, rate limit, bad config, network).
+    Abort,
+}
+
 /// A public IP attached to an Instance.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PublicIp {
+    #[serde(default)]
+    pub id: String,
     pub address: String,
     pub family: String,
+    /// Reserved flexible IPs are owned by us; dynamic ones die with the server.
+    #[serde(default = "default_dynamic")]
+    pub dynamic: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn default_dynamic() -> bool {
+    true
+}
+
+/// A reserved flexible IPv4.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Ip {
+    pub id: String,
+    pub address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateIpRequest {
+    project: String,
+    tags: Vec<String>,
+    #[serde(rename = "type")]
+    ip_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpResponse {
+    ip: Ip,
 }
 
 /// A volume attached to an Instance.
@@ -145,6 +186,7 @@ struct CreateServerRequest {
     commercial_type: String,
     image: String,
     dynamic_ip_required: bool,
+    public_ips: Vec<String>,
     tags: Vec<String>,
     volumes: HashMap<String, VolumeTemplate>,
 }
@@ -164,6 +206,11 @@ struct UpdateVolumeIopsRequest {
 #[derive(Debug, Serialize)]
 struct ActionRequest<'a> {
     action: &'a str,
+}
+
+/// Builds a zonal Instance API URL.
+fn zone_url(zone: &str, path: &str) -> String {
+    format!("{}/instance/v1/zones/{}{}", SCALEWAY_API_URL, zone, path)
 }
 
 /// Returns only the server whose name matches exactly.
@@ -227,6 +274,44 @@ fn iops_to_apply(volume_type: &str, volume_iops: Option<u32>) -> Option<u32> {
     }
 }
 
+/// Returns true when the server has a non-empty IPv4 address attached.
+pub fn server_has_public_ipv4(server: &Server) -> bool {
+    server
+        .public_ips
+        .iter()
+        .any(|ip| ip.family == "inet" && !ip.address.is_empty())
+}
+
+/// Returns reserved IP IDs owned by the orchestrator.
+pub fn server_owned_ip_ids(server: &Server) -> Vec<String> {
+    server
+        .public_ips
+        .iter()
+        .filter(|ip| !ip.dynamic && ip.tags.iter().any(|tag| tag == "gitlab-runner"))
+        .map(|ip| ip.id.clone())
+        .collect()
+}
+
+/// Decides whether the next provisioning attempt should use another zone.
+pub fn classify_creation_failure(error: &ScalewayError) -> CreationFailure {
+    match error {
+        ScalewayError::Api {
+            status: 400 | 404 | 408 | 409 | 500 | 502 | 503 | 504,
+            ..
+        } => CreationFailure::NextZone,
+        _ => CreationFailure::Abort,
+    }
+}
+
+/// Builds the request that reserves a flexible IPv4 in a zone.
+fn build_create_ip_request(config: &ScalewayConfig) -> CreateIpRequest {
+    CreateIpRequest {
+        project: config.project_id.clone(),
+        tags: vec!["gitlab-runner".to_string()],
+        ip_type: "routed_ipv4".to_string(),
+    }
+}
+
 /// Extracts volume IDs from a server, sorted by volume key for determinism.
 pub fn server_volume_ids(server: &Server) -> Vec<String> {
     let mut entries: Vec<(String, String)> = server
@@ -238,13 +323,19 @@ pub fn server_volume_ids(server: &Server) -> Vec<String> {
     entries.into_iter().map(|(_, id)| id).collect()
 }
 
+/// Validates the provisioning settings that are common to every zone.
+pub fn validate_config(config: &ScalewayConfig) -> Result<(), ScalewayError> {
+    validate_volume_config(config.volume_size_gb, &config.volume_type)?;
+    validate_volume_iops(config.volume_iops)
+}
+
 /// Builds the create-server request body.
 fn build_create_request(
     config: &ScalewayConfig,
     name: &str,
+    ip_id: &str,
 ) -> Result<CreateServerRequest, ScalewayError> {
-    validate_volume_config(config.volume_size_gb, &config.volume_type)?;
-    validate_volume_iops(config.volume_iops)?;
+    validate_config(config)?;
 
     let mut tags = vec!["gitlab-runner".to_string()];
     if let Some(ref key) = config.ssh_public_key {
@@ -266,7 +357,8 @@ fn build_create_request(
         project: config.project_id.clone(),
         commercial_type: config.server_type.clone(),
         image: config.image.clone(),
-        dynamic_ip_required: true,
+        dynamic_ip_required: false,
+        public_ips: vec![ip_id.to_string()],
         tags,
         volumes,
     })
@@ -301,17 +393,12 @@ impl ScalewayClient {
         }
     }
 
-    fn zone_url(&self, path: &str) -> String {
-        format!(
-            "{}/instance/v1/zones/{}{}",
-            SCALEWAY_API_URL,
-            self.config.primary_zone(),
-            path
-        )
-    }
-
-    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ScalewayError> {
-        let url = self.zone_url(path);
+    async fn get<T: for<'de> Deserialize<'de>>(
+        &self,
+        zone: &str,
+        path: &str,
+    ) -> Result<T, ScalewayError> {
+        let url = zone_url(zone, path);
         debug!("Scaleway API GET: {}", url);
         let response = self
             .client
@@ -324,10 +411,11 @@ impl ScalewayClient {
 
     async fn post<T: for<'de> Deserialize<'de>, B: Serialize>(
         &self,
+        zone: &str,
         path: &str,
         body: &B,
     ) -> Result<T, ScalewayError> {
-        let url = self.zone_url(path);
+        let url = zone_url(zone, path);
         debug!("Scaleway API POST: {}", url);
         let response = self
             .client
@@ -350,8 +438,8 @@ impl ScalewayClient {
         Self::handle_json(response).await
     }
 
-    async fn patch_text(&self, path: &str, body: &str) -> Result<(), ScalewayError> {
-        let url = self.zone_url(path);
+    async fn patch_text(&self, zone: &str, path: &str, body: &str) -> Result<(), ScalewayError> {
+        let url = zone_url(zone, path);
         debug!("Scaleway API PATCH: {}", url);
         let response = self
             .client
@@ -422,15 +510,24 @@ impl ScalewayClient {
         Ok(())
     }
 
-    /// Finds a server by exact name.
-    pub async fn find_server_by_name(&self, name: &str) -> Result<Option<Server>, ScalewayError> {
-        let response: ServersResponse = self.get(&format!("/servers?name={}", name)).await?;
+    /// Finds a server by exact name in a zone.
+    pub async fn find_server_by_name(
+        &self,
+        zone: &str,
+        name: &str,
+    ) -> Result<Option<Server>, ScalewayError> {
+        let response: ServersResponse = self.get(zone, &format!("/servers?name={}", name)).await?;
         Ok(exact_name_match(response.servers, name))
     }
 
     /// Fetches a server by ID; returns `None` on 404.
-    pub async fn get_server(&self, server_id: &str) -> Result<Option<Server>, ScalewayError> {
-        let result: Result<ServerResponse, _> = self.get(&format!("/servers/{}", server_id)).await;
+    pub async fn get_server(
+        &self,
+        zone: &str,
+        server_id: &str,
+    ) -> Result<Option<Server>, ScalewayError> {
+        let result: Result<ServerResponse, _> =
+            self.get(zone, &format!("/servers/{}", server_id)).await;
         match result {
             Ok(response) => Ok(Some(response.server)),
             Err(ScalewayError::Api { status: 404, .. }) => Ok(None),
@@ -438,36 +535,63 @@ impl ScalewayClient {
         }
     }
 
-    /// Creates a server, applies cloud-init, and powers it on.
+    /// Reserves a flexible IPv4 in a zone.
+    ///
+    /// Doing this before creating the Instance means a zone without addresses
+    /// is skipped without creating (and billing) an unusable server.
+    pub async fn create_ip(&self, zone: &str) -> Result<Ip, ScalewayError> {
+        let request = build_create_ip_request(&self.config);
+        let response: IpResponse = self.post(zone, "/ips", &request).await?;
+        info!(
+            "Reserved IPv4 {} in zone {} (ID: {})",
+            response.ip.address, zone, response.ip.id
+        );
+        Ok(response.ip)
+    }
+
+    /// Creates a server in the `stopped` state with a reserved IP attached.
     ///
     /// Scaleway creates the Instance in the `stopped` state, so the requested
-    /// volume can be booted with the user-data in place.
-    pub async fn create_server(
+    /// volume can be booted with the user-data in place. The caller owns the
+    /// returned server and is responsible for cleanup if a later step fails.
+    pub async fn create_server_stopped(
         &self,
+        zone: &str,
         name: &str,
-        cloud_init: &str,
+        ip_id: &str,
     ) -> Result<Server, ScalewayError> {
-        info!("Creating server: {}", name);
+        info!("Creating server in zone {}: {}", zone, name);
 
-        let request = build_create_request(&self.config, name)?;
-        let response: CreateServerResponse = self.post("/servers", &request).await?;
+        let request = build_create_request(&self.config, name, ip_id)?;
+        let response: CreateServerResponse = self.post(zone, "/servers", &request).await?;
         let server = response.server;
         info!(
-            "Server created: {} (ID: {}, state: {})",
-            server.name, server.id, server.state
+            "Server created: {} (ID: {}, zone: {}, state: {})",
+            server.name, server.id, zone, server.state
         );
 
-        self.wait_for_state(&server.id, "stopped", STOPPED_TIMEOUT_SECS)
+        Ok(server)
+    }
+
+    /// Waits for the stopped server, applies cloud-init, and powers it on.
+    pub async fn prepare_server(
+        &self,
+        zone: &str,
+        server: &Server,
+        cloud_init: &str,
+    ) -> Result<Server, ScalewayError> {
+        self.wait_for_state(zone, &server.id, "stopped", STOPPED_TIMEOUT_SECS)
             .await?;
-        self.apply_root_volume_iops(&server).await;
+        self.apply_root_volume_iops(zone, server).await;
         self.patch_text(
+            zone,
             &format!("/servers/{}/user_data/cloud-init", server.id),
             cloud_init,
         )
         .await?;
-        self.action(&server.id, "poweron").await?;
+        self.action(zone, &server.id, "poweron").await?;
         let server = self
-            .wait_for_state(&server.id, "running", RUNNING_TIMEOUT_SECS)
+            .wait_for_state(zone, &server.id, "running", RUNNING_TIMEOUT_SECS)
             .await?;
 
         if let Some(ip) = server.public_ips.iter().find(|ip| ip.family == "inet") {
@@ -484,7 +608,7 @@ impl ScalewayClient {
     /// the `sbs` storage class, so switching between 5000 and 15000 IOPS is
     /// permitted. Failures are logged but do not abort provisioning: the runner
     /// remains usable at the default 5000 IOPS.
-    async fn apply_root_volume_iops(&self, server: &Server) {
+    async fn apply_root_volume_iops(&self, zone: &str, server: &Server) {
         let iops = match iops_to_apply(&self.config.volume_type, self.config.volume_iops) {
             Some(iops) => iops,
             None => {
@@ -510,7 +634,7 @@ impl ScalewayClient {
 
         info!("Setting root volume {} IOPS to {}", volume_id, iops);
         for attempt in 1..=IOPS_UPDATE_ATTEMPTS {
-            match self.update_volume_iops(volume_id, iops).await {
+            match self.update_volume_iops(zone, volume_id, iops).await {
                 Ok(()) => {
                     info!("Root volume {} now at {} IOPS", volume_id, iops);
                     return;
@@ -533,22 +657,25 @@ impl ScalewayClient {
     }
 
     /// Updates a Block volume's IOPS class via the Block Storage API.
-    async fn update_volume_iops(&self, volume_id: &str, iops: u32) -> Result<(), ScalewayError> {
+    async fn update_volume_iops(
+        &self,
+        zone: &str,
+        volume_id: &str,
+        iops: u32,
+    ) -> Result<(), ScalewayError> {
         let url = format!(
             "{}/block/v1/zones/{}/volumes/{}",
-            SCALEWAY_API_URL,
-            self.config.primary_zone(),
-            volume_id
+            SCALEWAY_API_URL, zone, volume_id
         );
         self.patch_json(&url, &UpdateVolumeIopsRequest { perf_iops: iops })
             .await
     }
 
-    async fn action(&self, server_id: &str, action: &str) -> Result<(), ScalewayError> {
+    async fn action(&self, zone: &str, server_id: &str, action: &str) -> Result<(), ScalewayError> {
         info!("Server {} action: {}", server_id, action);
         let response = self
             .client
-            .post(self.zone_url(&format!("/servers/{}/action", server_id)))
+            .post(zone_url(zone, &format!("/servers/{}/action", server_id)))
             .header("X-Auth-Token", &self.token)
             .json(&ActionRequest { action })
             .send()
@@ -560,35 +687,35 @@ impl ScalewayClient {
     ///
     /// Waits until the server no longer exists so that its Block Storage
     /// volumes are detached and can be deleted by the caller.
-    pub async fn terminate_server(&self, server_id: &str) -> Result<(), ScalewayError> {
-        info!("Terminating server: {}", server_id);
-        match self.action(server_id, "terminate").await {
+    pub async fn terminate_server(&self, zone: &str, server_id: &str) -> Result<(), ScalewayError> {
+        info!("Terminating server {} in zone {}", server_id, zone);
+        match self.action(zone, server_id, "terminate").await {
             Ok(()) => {}
             Err(e) => {
                 warn!("Terminate failed for {} ({}); falling back", server_id, e);
-                self.terminate_fallback(server_id).await?;
+                self.terminate_fallback(zone, server_id).await?;
             }
         }
-        self.wait_for_server_gone(server_id).await?;
+        self.wait_for_server_gone(zone, server_id).await?;
         info!("Server {} terminated", server_id);
         Ok(())
     }
 
-    async fn terminate_fallback(&self, server_id: &str) -> Result<(), ScalewayError> {
-        match self.get_server(server_id).await? {
+    async fn terminate_fallback(&self, zone: &str, server_id: &str) -> Result<(), ScalewayError> {
+        match self.get_server(zone, server_id).await? {
             None => Ok(()),
-            Some(server) if server.state == "stopped" => self.delete_server(server_id).await,
+            Some(server) if server.state == "stopped" => self.delete_server(zone, server_id).await,
             Some(_) => {
-                self.action(server_id, "poweroff").await?;
-                self.wait_for_state(server_id, "stopped", STOPPED_TIMEOUT_SECS)
+                self.action(zone, server_id, "poweroff").await?;
+                self.wait_for_state(zone, server_id, "stopped", STOPPED_TIMEOUT_SECS)
                     .await?;
-                self.delete_server(server_id).await
+                self.delete_server(zone, server_id).await
             }
         }
     }
 
-    async fn delete_server(&self, server_id: &str) -> Result<(), ScalewayError> {
-        let url = self.zone_url(&format!("/servers/{}", server_id));
+    async fn delete_server(&self, zone: &str, server_id: &str) -> Result<(), ScalewayError> {
+        let url = zone_url(zone, &format!("/servers/{}", server_id));
         match self.delete_url(&url).await {
             Ok(()) => Ok(()),
             Err(ScalewayError::Api { status: 404, .. }) => Ok(()),
@@ -599,28 +726,41 @@ impl ScalewayClient {
     /// Deletes volumes via the Block Storage API.
     ///
     /// Waits for each volume to be detached before deleting. 404s count as
-    /// success (`terminate` already removed local volumes). Returns the IDs
+    /// success (`terminate` already removed local volumes). Returns the entries
     /// that could not be deleted so callers can persist them for retry.
-    pub async fn delete_volumes(&self, volume_ids: &[String]) -> Vec<String> {
+    pub async fn delete_volumes(&self, volumes: &[ZonedId]) -> Vec<ZonedId> {
         let mut failed = Vec::new();
-        for volume_id in volume_ids {
-            if let Err(e) = self.delete_volume(volume_id).await {
-                warn!("Failed to delete volume {}: {}", volume_id, e);
-                failed.push(volume_id.clone());
+        for volume in volumes {
+            let result = match &volume.zone {
+                Some(zone) => self.delete_volume(zone, &volume.id).await,
+                None => self.delete_volume_unknown_zone(&volume.id).await,
+            };
+            if let Err(e) = result {
+                warn!("Failed to delete volume {}: {}", volume.id, e);
+                failed.push(volume.clone());
             }
         }
         failed
     }
 
+    /// Deletes a volume whose zone is unknown by finding it across zones.
+    async fn delete_volume_unknown_zone(&self, volume_id: &str) -> Result<(), ScalewayError> {
+        for zone in &self.config.zones {
+            if self.get_block_volume(zone, volume_id).await?.is_some() {
+                return self.delete_volume(zone, volume_id).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn get_block_volume(
         &self,
+        zone: &str,
         volume_id: &str,
     ) -> Result<Option<BlockVolumeGetResponse>, ScalewayError> {
         let url = format!(
             "{}/block/v1/zones/{}/volumes/{}",
-            SCALEWAY_API_URL,
-            self.config.primary_zone(),
-            volume_id
+            SCALEWAY_API_URL, zone, volume_id
         );
         match self.get_url::<BlockVolumeGetResponse>(&url).await {
             Ok(volume) => Ok(Some(volume)),
@@ -629,10 +769,14 @@ impl ScalewayClient {
         }
     }
 
-    async fn wait_for_volume_detached(&self, volume_id: &str) -> Result<(), ScalewayError> {
+    async fn wait_for_volume_detached(
+        &self,
+        zone: &str,
+        volume_id: &str,
+    ) -> Result<(), ScalewayError> {
         let attempts = (VOLUME_DETACH_TIMEOUT_SECS / STATE_POLL_INTERVAL_SECS).max(1);
         for _ in 0..attempts {
-            match self.get_block_volume(volume_id).await? {
+            match self.get_block_volume(zone, volume_id).await? {
                 None => return Ok(()),
                 Some(volume) if block_volume_is_deletable(volume.status()) => return Ok(()),
                 Some(_) => sleep(Duration::from_secs(STATE_POLL_INTERVAL_SECS)).await,
@@ -643,14 +787,12 @@ impl ScalewayClient {
         })
     }
 
-    async fn delete_volume(&self, volume_id: &str) -> Result<(), ScalewayError> {
-        self.wait_for_volume_detached(volume_id).await?;
+    async fn delete_volume(&self, zone: &str, volume_id: &str) -> Result<(), ScalewayError> {
+        self.wait_for_volume_detached(zone, volume_id).await?;
         for attempt in 1..=VOLUME_DELETE_ATTEMPTS {
             let url = format!(
                 "{}/block/v1/zones/{}/volumes/{}",
-                SCALEWAY_API_URL,
-                self.config.primary_zone(),
-                volume_id
+                SCALEWAY_API_URL, zone, volume_id
             );
             match self.delete_url(&url).await {
                 Ok(()) => {
@@ -674,16 +816,62 @@ impl ScalewayClient {
         unreachable!("loop always returns on the final attempt")
     }
 
+    /// Releases a reserved IPv4. A 404 means it is already gone.
+    async fn delete_ip(&self, zone: &str, ip_id: &str) -> Result<(), ScalewayError> {
+        let url = zone_url(zone, &format!("/ips/{}", ip_id));
+        match self.delete_url(&url).await {
+            Ok(()) => {
+                info!("Released IPv4 {}", ip_id);
+                Ok(())
+            }
+            Err(ScalewayError::Api { status: 404, .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Deletes reserved IPs and returns the entries that failed.
+    pub async fn delete_ips(&self, ips: &[ZonedId]) -> Vec<ZonedId> {
+        let mut failed = Vec::new();
+        for ip in ips {
+            let result = match &ip.zone {
+                Some(zone) => self.delete_ip(zone, &ip.id).await,
+                None => self.delete_ip_unknown_zone(&ip.id).await,
+            };
+            if let Err(e) = result {
+                warn!("Failed to release IP {}: {}", ip.id, e);
+                failed.push(ip.clone());
+            }
+        }
+        failed
+    }
+
+    /// Deletes an IP whose zone is unknown by trying every configured zone.
+    async fn delete_ip_unknown_zone(&self, ip_id: &str) -> Result<(), ScalewayError> {
+        for zone in &self.config.zones {
+            let url = zone_url(zone, &format!("/ips/{}", ip_id));
+            match self.delete_url(&url).await {
+                Ok(()) => {
+                    info!("Released IPv4 {}", ip_id);
+                    return Ok(());
+                }
+                Err(ScalewayError::Api { status: 404, .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Polls until the server reaches the desired state or the timeout elapses.
     pub async fn wait_for_state(
         &self,
+        zone: &str,
         server_id: &str,
         desired: &str,
         timeout_secs: u64,
     ) -> Result<Server, ScalewayError> {
         let attempts = (timeout_secs / STATE_POLL_INTERVAL_SECS).max(1);
         for _ in 0..attempts {
-            match self.get_server(server_id).await? {
+            match self.get_server(zone, server_id).await? {
                 Some(server) if server.state == desired => return Ok(server),
                 Some(_) => sleep(Duration::from_secs(STATE_POLL_INTERVAL_SECS)).await,
                 None => {
@@ -701,10 +889,14 @@ impl ScalewayClient {
     }
 
     /// Polls until the server no longer exists (termination complete).
-    pub async fn wait_for_server_gone(&self, server_id: &str) -> Result<(), ScalewayError> {
+    pub async fn wait_for_server_gone(
+        &self,
+        zone: &str,
+        server_id: &str,
+    ) -> Result<(), ScalewayError> {
         let attempts = (TERMINATED_TIMEOUT_SECS / STATE_POLL_INTERVAL_SECS).max(1);
         for _ in 0..attempts {
-            if self.get_server(server_id).await?.is_none() {
+            if self.get_server(zone, server_id).await?.is_none() {
                 return Ok(());
             }
             sleep(Duration::from_secs(STATE_POLL_INTERVAL_SECS)).await;
@@ -728,6 +920,105 @@ mod tests {
             public_ips: vec![],
             volumes: HashMap::new(),
         }
+    }
+
+    fn test_config() -> ScalewayConfig {
+        ScalewayConfig {
+            token: "t".to_string(),
+            project_id: "p".to_string(),
+            zones: vec!["fr-par-1".to_string()],
+            server_type: "PRO2-XS".to_string(),
+            image: "ubuntu_noble".to_string(),
+            ssh_public_key: None,
+            volume_size_gb: 50,
+            volume_type: "sbs_volume".to_string(),
+            volume_iops: None,
+        }
+    }
+
+    fn public_ip(id: &str, family: &str, address: &str, dynamic: bool, tags: &[&str]) -> PublicIp {
+        PublicIp {
+            id: id.to_string(),
+            address: address.to_string(),
+            family: family.to_string(),
+            dynamic,
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_server_has_public_ipv4() {
+        let mut s = server("id-1", "runner");
+        s.public_ips = vec![public_ip("ip-6", "inet6", "2001:db8::1", false, &[])];
+        assert!(!server_has_public_ipv4(&s));
+
+        s.public_ips
+            .push(public_ip("ip-4", "inet", "203.0.113.1", false, &[]));
+        assert!(server_has_public_ipv4(&s));
+
+        s.public_ips = vec![public_ip("ip-4", "inet", "", false, &[])];
+        assert!(!server_has_public_ipv4(&s));
+    }
+
+    #[test]
+    fn test_server_owned_ip_ids_filters_dynamic_and_untagged() {
+        let mut s = server("id-1", "runner");
+        s.public_ips = vec![
+            public_ip("ip-owned", "inet", "203.0.113.1", false, &["gitlab-runner"]),
+            public_ip(
+                "ip-dynamic",
+                "inet",
+                "203.0.113.2",
+                true,
+                &["gitlab-runner"],
+            ),
+            public_ip("ip-manual", "inet", "203.0.113.3", false, &["my-static-ip"]),
+        ];
+        assert_eq!(server_owned_ip_ids(&s), vec!["ip-owned".to_string()]);
+    }
+
+    #[test]
+    fn test_classify_creation_failure() {
+        let next_zone = [400, 404, 408, 409, 500, 502, 503, 504];
+        for status in next_zone {
+            let error = ScalewayError::Api {
+                status,
+                message: "insufficient resources".to_string(),
+            };
+            assert_eq!(
+                classify_creation_failure(&error),
+                CreationFailure::NextZone,
+                "status {} should try the next zone",
+                status
+            );
+        }
+
+        let abort = [401, 403, 418, 429];
+        for status in abort {
+            let error = ScalewayError::Api {
+                status,
+                message: "nope".to_string(),
+            };
+            assert_eq!(
+                classify_creation_failure(&error),
+                CreationFailure::Abort,
+                "status {} should abort",
+                status
+            );
+        }
+
+        assert_eq!(
+            classify_creation_failure(&ScalewayError::InvalidConfig("bad".to_string())),
+            CreationFailure::Abort
+        );
+    }
+
+    #[test]
+    fn test_build_create_ip_request() {
+        let request = build_create_ip_request(&test_config());
+        assert_eq!(request.project, "p");
+        assert_eq!(request.ip_type, "routed_ipv4");
+        assert_eq!(request.tags, vec!["gitlab-runner".to_string()]);
     }
 
     #[test]
@@ -780,21 +1071,22 @@ mod tests {
     }
 
     #[test]
+    fn test_zone_url_uses_given_zone() {
+        assert_eq!(
+            zone_url("fr-par-2", "/servers"),
+            "https://api.scaleway.com/instance/v1/zones/fr-par-2/servers"
+        );
+    }
+
+    #[test]
     fn test_build_create_request_includes_key_tag_and_volume() {
-        let config = ScalewayConfig {
-            token: "t".to_string(),
-            project_id: "p".to_string(),
-            zones: vec!["fr-par-1".to_string()],
-            server_type: "PRO2-XS".to_string(),
-            image: "ubuntu_noble".to_string(),
-            ssh_public_key: Some("ssh-ed25519 AAAA key".to_string()),
-            volume_size_gb: 50,
-            volume_type: "sbs_volume".to_string(),
-            volume_iops: None,
-        };
-        let request = build_create_request(&config, "flexi-runner").unwrap();
+        let mut config = test_config();
+        config.ssh_public_key = Some("ssh-ed25519 AAAA key".to_string());
+        let request = build_create_request(&config, "flexi-runner", "ip-1").unwrap();
         assert_eq!(request.name, "flexi-runner");
         assert_eq!(request.project, "p");
+        assert_eq!(request.public_ips, vec!["ip-1".to_string()]);
+        assert!(!request.dynamic_ip_required);
         assert!(request
             .tags
             .contains(&"AUTHORIZED_KEY=ssh-ed25519_AAAA_key".to_string()));
@@ -806,18 +1098,7 @@ mod tests {
 
     #[test]
     fn test_build_create_request_without_key() {
-        let config = ScalewayConfig {
-            token: "t".to_string(),
-            project_id: "p".to_string(),
-            zones: vec!["fr-par-1".to_string()],
-            server_type: "PRO2-XS".to_string(),
-            image: "ubuntu_noble".to_string(),
-            ssh_public_key: None,
-            volume_size_gb: 50,
-            volume_type: "sbs_volume".to_string(),
-            volume_iops: None,
-        };
-        let request = build_create_request(&config, "flexi-runner").unwrap();
+        let request = build_create_request(&test_config(), "flexi-runner", "ip-1").unwrap();
         assert_eq!(request.tags, vec!["gitlab-runner".to_string()]);
     }
 
